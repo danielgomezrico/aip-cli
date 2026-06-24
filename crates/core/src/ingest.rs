@@ -61,7 +61,10 @@ pub fn repo_name_from_url(url: &str) -> String {
     let base = base.strip_suffix("/.git").unwrap_or(base);
     let last = base.rsplit(['/', ':']).next().unwrap_or("");
     let name = last.strip_suffix(".git").unwrap_or(last);
-    if name.is_empty() {
+    // The name is join()ed onto a temp dir in `ingest_url`; reject anything that
+    // would escape it (".", "..") or smuggle a separator (e.g. a backslash on a
+    // non-unix path), falling back to a safe placeholder.
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
         "plugin".to_string()
     } else {
         name.to_string()
@@ -185,6 +188,18 @@ mod tests {
         assert_eq!(repo_name_from_url("https://h/foo/bar.git?ref=main"), "bar");
         assert_eq!(repo_name_from_url("https://h/foo/bar/.git"), "bar");
         assert_eq!(repo_name_from_url(""), "plugin");
+    }
+
+    #[test]
+    fn repo_name_from_url_rejects_traversal_segments() {
+        // The derived name is join()ed onto a temp dir in `ingest_url`; it must
+        // never be "." / ".." (which would escape the checkout) nor contain a
+        // path separator. Such inputs fall back to the safe placeholder.
+        assert_eq!(repo_name_from_url("https://h/foo/.."), "plugin");
+        assert_eq!(repo_name_from_url("https://h/foo/."), "plugin");
+        assert_eq!(repo_name_from_url("git@host:.."), "plugin");
+        // A backslash-laden segment must not survive as a directory name.
+        assert_eq!(repo_name_from_url("https://h/a\\b"), "plugin");
     }
 
     #[test]

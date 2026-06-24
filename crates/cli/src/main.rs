@@ -403,32 +403,11 @@ fn cmd_list_plugins() -> Result<()> {
     Ok(())
 }
 
-/// Scan the `.aip-cli` store into a flat list of `(name, version)`, sorted by
-/// directory name. Mirrors `cmd_list_plugins`' discovery but returns data.
+/// Scan the `.aip-cli` store into a flat list of `(name, version)`. Delegates
+/// to the unit-tested core scanner, which keys each plugin by its manifest name
+/// (not its directory name) so doctor matches agents and modes correctly.
 fn scan_store() -> Vec<StorePlugin> {
-    let root = store::plugins_dir();
-    let mut dirs: Vec<PathBuf> = match std::fs::read_dir(&root) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir() && store::is_plugin_dir(p))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    dirs.sort();
-    dirs.iter()
-        .map(|d| {
-            let name = d
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
-            let version = PluginManifest::read(d)
-                .map(|m| m.version)
-                .unwrap_or_else(|_| "?".to_string());
-            StorePlugin { name, version }
-        })
-        .collect()
+    doctor::scan_store(&store::plugins_dir())
 }
 
 fn cmd_doctor(dir: PathBuf) -> Result<()> {

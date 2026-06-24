@@ -7,9 +7,11 @@
 
 use crate::agent_state::AgentPlugins;
 use crate::hook::{content_hash, Marker, MarkerTarget};
+use crate::manifest::PluginManifest;
 use crate::mode_apply::Target;
 use crate::modes;
-use std::path::PathBuf;
+use crate::store::is_plugin_dir;
+use std::path::{Path, PathBuf};
 
 // ─── inputs (gathered by the CLI) ────────────────────────────────────────────
 
@@ -18,6 +20,47 @@ use std::path::PathBuf;
 pub struct StorePlugin {
     pub name: String,
     pub version: String,
+}
+
+/// Scan the `.aip-cli` store at `plugins_root` into the list `build_report`
+/// cross-references, sorted by plugin name.
+///
+/// Each entry is keyed by its **manifest name**, not its directory name: the
+/// store folder for a plugin can differ from the name agents and modes use
+/// (e.g. the `android` folder holds the `android-native` plugin), and keying by
+/// the folder name would make such plugins look missing from the store. A
+/// directory whose manifest is unreadable falls back to its directory name with
+/// an unknown (`"?"`) version so it still shows up rather than silently
+/// vanishing.
+pub fn scan_store(plugins_root: &Path) -> Vec<StorePlugin> {
+    let mut dirs: Vec<PathBuf> = match std::fs::read_dir(plugins_root) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && is_plugin_dir(p))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    dirs.sort();
+    let mut out: Vec<StorePlugin> = dirs
+        .iter()
+        .map(|d| match PluginManifest::read(d) {
+            Ok(m) => StorePlugin {
+                name: m.name,
+                version: m.version,
+            },
+            Err(_) => StorePlugin {
+                name: d
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                version: "?".to_string(),
+            },
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 /// Raw per-agent input: whether it's on `PATH` and its parsed on-disk state.
@@ -381,6 +424,19 @@ mod tests {
         }
     }
 
+    /// Write a minimal plugin into `root/dir` with the given manifest name and
+    /// version. The directory name and manifest name are intentionally allowed
+    /// to differ (as `android` vs `android-native` in the real store).
+    fn write_plugin(root: &std::path::Path, dir: &str, name: &str, version: &str) {
+        let meta = root.join(dir).join(".claude-plugin");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(
+            meta.join("plugin.json"),
+            format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn no_marker_reports_clean_project() {
         let r = build_report(ProjectInput::default(), store(&[]), vec![]);
@@ -542,5 +598,53 @@ mod tests {
         assert_eq!(r.project.pinned, Some(Target::Grok));
         assert!(!r.agents[0].drift);
         assert!(r.agents[0].missing_wanted.is_empty());
+    }
+
+    #[test]
+    fn scan_store_keys_by_manifest_name_not_dir_name() {
+        // Regression: the `android` folder holds the `android-native` plugin and
+        // `flutter` holds `flutter-pivara`. The store list must be keyed by the
+        // manifest name (what agents and modes use), not the directory name —
+        // otherwise doctor reports these plugins as missing/orphaned.
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_plugin(tmp.path(), "android", "android-native", "1.0.1");
+        write_plugin(tmp.path(), "flutter", "flutter-pivara", "1.1.0");
+        write_plugin(tmp.path(), "product", "product", "2.0.0");
+        std::fs::create_dir_all(tmp.path().join("not-a-plugin")).unwrap();
+
+        let scanned = scan_store(tmp.path());
+        let names: Vec<&str> = scanned.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["android-native", "flutter-pivara", "product"]);
+        assert_eq!(scanned[0].version, "1.0.1");
+    }
+
+    #[test]
+    fn scanned_store_makes_enabled_plugin_not_an_orphan() {
+        // End-to-end: a plugin enabled under its manifest name must not be
+        // flagged as an orphan just because its store folder is named differently.
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_plugin(tmp.path(), "android", "android-native", "1.0.1");
+
+        let agents = vec![agent(Target::ClaudeCode, true, &["android-native"], &[])];
+        let r = build_report(ProjectInput::default(), scan_store(tmp.path()), agents);
+        assert!(
+            r.agents[0].orphans.is_empty(),
+            "android-native is in the store (folder `android`) and must not be an orphan"
+        );
+    }
+
+    #[test]
+    fn scan_store_falls_back_to_dir_name_on_unreadable_manifest() {
+        // A plugin dir whose manifest is present but malformed still appears,
+        // keyed by its directory name with an unknown version, instead of vanishing.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let meta = tmp.path().join("broken").join(".claude-plugin");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(meta.join("plugin.json"), "{not json").unwrap();
+
+        let scanned = scan_store(tmp.path());
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].name, "broken");
+        assert_eq!(scanned[0].version, "?");
     }
 }

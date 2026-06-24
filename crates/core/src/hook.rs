@@ -62,7 +62,7 @@ impl Marker {
     /// `target` line is written, so the mode applies to every installed agent.
     /// Always parses back to an equal `Marker`.
     pub fn render(mode: &str, target: Option<MarkerTarget>) -> String {
-        let mut out = format!("mode = \"{}\"\n", mode);
+        let mut out = format!("mode = {}\n", toml_basic_string(mode));
         match target {
             Some(MarkerTarget::Grok) => out.push_str("target = \"grok\"\n"),
             Some(MarkerTarget::Claude) => out.push_str("target = \"claude\"\n"),
@@ -70,6 +70,28 @@ impl Marker {
         }
         out
     }
+}
+
+/// Quote `s` as a TOML basic (double-quoted) string, escaping the characters
+/// TOML requires so the result always parses back to exactly `s`.
+fn toml_basic_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\u{:04X}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Hex SHA-256 of a marker's content — the trust + change-detection key.
@@ -335,6 +357,26 @@ mod tests {
         let parsed = Marker::parse(&body).unwrap();
         assert_eq!(parsed.mode, "frontend product");
         assert_eq!(parsed.target, Some(MarkerTarget::Grok));
+    }
+
+    #[test]
+    fn marker_render_escapes_special_chars_and_roundtrips() {
+        // render() documents "Always parses back to an equal Marker". A mode
+        // carrying a quote, backslash, or control char must still produce valid
+        // TOML that round-trips to the exact same string.
+        for mode in [
+            "a\"b",
+            "back\\slash",
+            "q\"and\\slash",
+            "tab\there",
+            "nl\nhere",
+        ] {
+            let body = Marker::render(mode, Some(MarkerTarget::Grok));
+            let parsed = Marker::parse(&body)
+                .unwrap_or_else(|e| panic!("render({mode:?}) produced invalid TOML: {e}\n{body}"));
+            assert_eq!(parsed.mode, mode, "mode did not round-trip");
+            assert_eq!(parsed.target, Some(MarkerTarget::Grok));
+        }
     }
 
     #[test]

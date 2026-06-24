@@ -80,6 +80,9 @@ pub fn parse_claude(settings_json: &str) -> AgentPlugins {
             disabled.push(name);
         }
     }
+    // The same plugin can appear under several marketplace keys; enabled in any
+    // one wins, so a name is "disabled" only when it is never enabled.
+    disabled.retain(|d| !enabled.contains(d));
     AgentPlugins::normalized(enabled, disabled)
 }
 
@@ -157,6 +160,18 @@ mod tests {
     #[test]
     fn parse_claude_malformed_is_empty_not_panic() {
         assert_eq!(parse_claude("{not json"), AgentPlugins::default());
+    }
+
+    #[test]
+    fn parse_claude_enabled_wins_over_disabled_for_same_plugin() {
+        // The same plugin installed from two marketplaces, one on and one off.
+        // It must not show up as both enabled and disabled: being enabled
+        // anywhere means enabled, so it must be absent from `disabled`.
+        let json = r#"{"enabledPlugins":{"x@a":true,"x@b":false}}"#;
+        let p = parse_claude(json);
+        assert_eq!(p.enabled, vec!["x"]);
+        assert!(p.disabled.is_empty(), "x must not be listed as disabled");
+        assert!(p.is_enabled("x"));
     }
 
     #[test]

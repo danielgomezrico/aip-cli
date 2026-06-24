@@ -2,6 +2,20 @@
 
 Enable/disable plugins, skills, and agents per folder. No uninstalls, no permanent bloat.
 
+## How to install
+
+macOS / Linux:
+
+```bash
+git clone https://github.com/dan/aip-cli.git && cd aip-cli && make install
+```
+
+## How to compile
+
+```bash
+git clone https://github.com/dan/aip-cli.git && cd aip-cli && make build && make test
+```
+
 ## Why
 
 AI agents load everything you have enabled into context. Keep everything on → constant low context. Uninstalling to switch → annoying.
