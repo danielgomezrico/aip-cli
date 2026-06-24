@@ -1,0 +1,18 @@
+[package]
+name = "aip_core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core domain logic for the aip-cli CLI: plugin discovery, mode resolution, setup orchestration, and shell-hook trust."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+sha2.workspace = true
+dirs.workspace = true
+tempfile.workspace = true

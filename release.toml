@@ -1,0 +1,9 @@
+# cargo-release configuration.
+# Cargo.toml is the single source of truth for the version (SemVer);
+# `cargo release <level>` bumps it, updates the changelog, commits, and tags.
+allow-branch = ["main"]
+sign-tag = false
+tag-name = "v{{version}}"
+pre-release-commit-message = "chore(release): aip-cli {{version}}"
+consolidate-commits = true
+shared-version = true

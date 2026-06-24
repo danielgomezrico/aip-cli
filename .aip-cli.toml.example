@@ -1,0 +1,4 @@
+# Copy to `.aip-cli.toml` in a repo to auto-activate a mode on `cd`.
+# Then trust it once:  aip-cli allow
+mode = "mobile"
+# target = "grok"   # optional: pin to ONE agent. Omit to apply to ALL installed agents.

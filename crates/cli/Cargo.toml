@@ -1,0 +1,18 @@
+[package]
+name = "aip-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aip-cli: install, switch, and auto-activate Claude Code / Grok plugin modes on cd."
+
+[[bin]]
+name = "aip-cli"
+path = "src/main.rs"
+
+[dependencies]
+aip_core = { path = "../core" }
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
