@@ -80,12 +80,39 @@ fn copy_symlink(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// A naming collision in the store: the directory `slot` already holds plugin
+/// `existing`, and we are being asked to install a *different* plugin `incoming`
+/// in its place. Passed to the conflict callback of [`install_plugin_with`] so
+/// the caller can decide (e.g. by prompting) whether to overwrite.
+#[derive(Debug, Clone, Copy)]
+pub struct StoreConflict<'a> {
+    /// Destination directory inside the store that is already occupied.
+    pub slot: &'a Path,
+    /// Manifest name of the plugin currently in the slot.
+    pub existing: &'a str,
+    /// Manifest name of the plugin being installed.
+    pub incoming: &'a str,
+}
+
 /// Copy the plugin at `src` into the store directory `plugins_root`, placing it
-/// under its source folder name. An existing copy with the same name is
-/// replaced. Returns the destination path.
+/// under its source folder name. An existing copy of the *same* plugin is
+/// replaced; a *different* plugin occupying the same slot is refused. Returns
+/// the destination path.
 ///
 /// Errors if `src` is not a plugin directory.
 pub fn install_plugin(src: &Path, plugins_root: &Path) -> std::io::Result<PathBuf> {
+    // Default policy: never clobber a different plugin.
+    install_plugin_with(src, plugins_root, &mut |_| false)
+}
+
+/// Like [`install_plugin`], but on a different-plugin slot collision it consults
+/// `on_conflict`. Returning `true` overwrites the slot; `false` refuses with an
+/// `AlreadyExists` error. Replacing the *same* plugin never invokes the callback.
+pub fn install_plugin_with(
+    src: &Path,
+    plugins_root: &Path,
+    on_conflict: &mut dyn FnMut(&StoreConflict) -> bool,
+) -> std::io::Result<PathBuf> {
     if !is_plugin_dir(src) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -103,21 +130,28 @@ pub fn install_plugin(src: &Path, plugins_root: &Path) -> std::io::Result<PathBu
     })?;
     let dest = plugins_root.join(&name);
     if dest.exists() {
-        // Replacing the same plugin is fine; refuse to silently clobber a
-        // *different* plugin that happens to occupy the same directory name.
+        // Replacing the same plugin is fine; a *different* plugin sharing the
+        // directory name is only overwritten when `on_conflict` approves it.
         if let (Ok(existing), Ok(incoming)) =
             (PluginManifest::read(&dest), PluginManifest::read(src))
         {
             if existing.name != incoming.name {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!(
-                        "store slot {} already holds plugin '{}'; refusing to overwrite with '{}'",
-                        dest.display(),
-                        existing.name,
-                        incoming.name
-                    ),
-                ));
+                let conflict = StoreConflict {
+                    slot: &dest,
+                    existing: &existing.name,
+                    incoming: &incoming.name,
+                };
+                if !on_conflict(&conflict) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "store slot {} already holds plugin '{}'; refusing to overwrite with '{}'",
+                            dest.display(),
+                            existing.name,
+                            incoming.name
+                        ),
+                    ));
+                }
             }
         }
         std::fs::remove_dir_all(&dest)?;
@@ -222,6 +256,28 @@ mod tests {
         // The original survives.
         let kept = PluginManifest::read(&store.join("tools")).unwrap();
         assert_eq!(kept.name, "alpha");
+    }
+
+    #[test]
+    fn install_plugin_with_overwrites_when_conflict_approved() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let a = tmp.path().join("a").join("tools");
+        make_plugin(&a, "alpha");
+        install_plugin(&a, &store).unwrap();
+        // A different plugin in the same slot is overwritten when the callback
+        // approves it, and the callback sees the real existing/incoming names.
+        let b = tmp.path().join("b").join("tools");
+        make_plugin(&b, "beta");
+        let mut seen = None;
+        install_plugin_with(&b, &store, &mut |c| {
+            seen = Some((c.existing.to_string(), c.incoming.to_string()));
+            true
+        })
+        .unwrap();
+        assert_eq!(seen, Some(("alpha".to_string(), "beta".to_string())));
+        let now = PluginManifest::read(&store.join("tools")).unwrap();
+        assert_eq!(now.name, "beta");
     }
 
     #[test]

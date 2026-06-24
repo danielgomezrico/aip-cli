@@ -16,7 +16,7 @@ use aip_core::hook::{
     self, content_hash, find_marker, hook_script, load_applied_hash, save_applied_hash, AutoAction,
     Marker, MarkerTarget, Shell, TrustStore,
 };
-use aip_core::ingest::{ingest_folder, ingest_url};
+use aip_core::ingest::{ingest_folder_with, ingest_url};
 use aip_core::manifest::PluginManifest;
 use aip_core::mode_apply::{apply_targets, available, Target, ALL_TARGETS};
 use aip_core::modes::{self, resolve};
@@ -78,6 +78,10 @@ enum Command {
     IngestFolder {
         /// Folder whose subdirectories are each a Claude plugin.
         folder: PathBuf,
+        /// Overwrite an occupied store slot without prompting when a different
+        /// plugin already holds it.
+        #[arg(long, short = 'y')]
+        force: bool,
     },
     /// Clone a plugin from a git URL into the .aip-cli store.
     IngestUrl {
@@ -128,7 +132,7 @@ fn main() -> Result<()> {
             dir,
             force,
         } => cmd_init(selectors, only, dir, force),
-        Command::IngestFolder { folder } => cmd_ingest_folder(folder),
+        Command::IngestFolder { folder, force } => cmd_ingest_folder(folder, force),
         Command::IngestUrl { url } => cmd_ingest_url(url),
         Command::ListPlugins => cmd_list_plugins(),
         Command::ListModes => cmd_list_modes(),
@@ -341,13 +345,38 @@ fn prompt_for_mode() -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-fn cmd_ingest_folder(folder: PathBuf) -> Result<()> {
+/// Ask a yes/no question on stdin, defaulting to no. Returns true only on an
+/// explicit `y`/`yes`. A closed/unreadable stdin counts as no.
+fn prompt_yes_no(question: &str) -> bool {
+    print!("{question} [y/N] ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn cmd_ingest_folder(folder: PathBuf, force: bool) -> Result<()> {
     let folder = folder
         .canonicalize()
         .with_context(|| format!("no such folder: {folder:?}"))?;
     let dest = store::plugins_dir();
     std::fs::create_dir_all(&dest).with_context(|| format!("creating store {}", dest.display()))?;
-    let ingested = ingest_folder(&folder, &dest)
+    // On a different-plugin slot collision, `--force`/`-y` overwrites silently;
+    // otherwise prompt and overwrite only on an affirmative answer.
+    let mut on_conflict = |c: &store::StoreConflict| {
+        if force {
+            return true;
+        }
+        prompt_yes_no(&format!(
+            "store slot {} holds plugin '{}'; overwrite with '{}'?",
+            c.slot.display(),
+            c.existing,
+            c.incoming
+        ))
+    };
+    let ingested = ingest_folder_with(&folder, &dest, &mut on_conflict)
         .with_context(|| format!("ingesting plugins from {}", folder.display()))?;
     if ingested.is_empty() {
         return Err(anyhow!(

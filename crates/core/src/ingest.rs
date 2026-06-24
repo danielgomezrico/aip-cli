@@ -9,7 +9,7 @@
 //! testable without touching the network.
 
 use crate::runner::{CommandRunner, Invocation};
-use crate::store::{install_plugin, is_plugin_dir, store_name};
+use crate::store::{install_plugin, install_plugin_with, is_plugin_dir, store_name, StoreConflict};
 use std::path::{Path, PathBuf};
 
 /// One plugin copied into the store.
@@ -27,6 +27,17 @@ pub struct Ingested {
 /// each into `plugins_root`. Subdirectories that are not plugins are skipped.
 /// Returns one [`Ingested`] per copied plugin, sorted by directory name.
 pub fn ingest_folder(folder: &Path, plugins_root: &Path) -> std::io::Result<Vec<Ingested>> {
+    // Default policy: refuse to overwrite a different plugin in an occupied slot.
+    ingest_folder_with(folder, plugins_root, &mut |_| false)
+}
+
+/// Like [`ingest_folder`], but on a different-plugin slot collision it consults
+/// `on_conflict` (e.g. to prompt the user). Returning `true` overwrites the slot.
+pub fn ingest_folder_with(
+    folder: &Path,
+    plugins_root: &Path,
+    on_conflict: &mut dyn FnMut(&StoreConflict) -> bool,
+) -> std::io::Result<Vec<Ingested>> {
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(folder)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -39,7 +50,7 @@ pub fn ingest_folder(folder: &Path, plugins_root: &Path) -> std::io::Result<Vec<
         if !is_plugin_dir(&dir) {
             continue;
         }
-        let dest = install_plugin(&dir, plugins_root)?;
+        let dest = install_plugin_with(&dir, plugins_root, on_conflict)?;
         out.push(Ingested {
             name: store_name(&dir).unwrap_or_default(),
             source: dir.display().to_string(),
