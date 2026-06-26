@@ -16,3 +16,4 @@ toml.workspace = true
 sha2.workspace = true
 dirs.workspace = true
 tempfile.workspace = true
+rayon = "1"

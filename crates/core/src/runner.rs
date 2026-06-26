@@ -5,9 +5,9 @@
 //! [`RecordingRunner`] to assert on the exact commands that *would* run without
 //! touching the system.
 
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 /// A single command invocation: program, arguments, and working directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +57,13 @@ pub trait CommandRunner {
     fn run(&self, inv: &Invocation) -> std::io::Result<Outcome>;
 }
 
+// Implement for Arc<R> to enable parallel execution.
+impl<R: CommandRunner + ?Sized> CommandRunner for std::sync::Arc<R> {
+    fn run(&self, inv: &Invocation) -> std::io::Result<Outcome> {
+        (**self).run(inv)
+    }
+}
+
 /// Runs commands for real via [`std::process::Command`], silencing the child's
 /// stdout/stderr so each `plugin enable/disable` call doesn't spam the terminal
 /// with its own per-plugin chatter — the caller renders one grouped summary
@@ -84,15 +91,15 @@ impl CommandRunner for SystemRunner {
 /// By default every command "succeeds". Use [`RecordingRunner::failing`] to make
 /// commands matching a predicate fail, exercising error paths.
 pub struct RecordingRunner {
-    calls: RefCell<Vec<Invocation>>,
+    calls: Mutex<Vec<Invocation>>,
     #[allow(clippy::type_complexity)]
-    fail_when: Option<Box<dyn Fn(&Invocation) -> bool>>,
+    fail_when: Option<Box<dyn Fn(&Invocation) -> bool + Send + Sync>>,
 }
 
 impl Default for RecordingRunner {
     fn default() -> Self {
         Self {
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
             fail_when: None,
         }
     }
@@ -104,22 +111,23 @@ impl RecordingRunner {
     }
 
     /// A runner where commands matching `predicate` return a failing outcome.
-    pub fn failing(predicate: impl Fn(&Invocation) -> bool + 'static) -> Self {
+    pub fn failing(predicate: impl Fn(&Invocation) -> bool + Send + Sync + 'static) -> Self {
         Self {
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
             fail_when: Some(Box::new(predicate)),
         }
     }
 
     /// All recorded invocations, in order.
     pub fn calls(&self) -> Vec<Invocation> {
-        self.calls.borrow().clone()
+        self.calls.lock().unwrap().clone()
     }
 
     /// Rendered command lines, in order — convenient for assertions.
     pub fn lines(&self) -> Vec<String> {
         self.calls
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .map(Invocation::display)
             .collect()
@@ -128,7 +136,7 @@ impl RecordingRunner {
     /// Working directories touched, deduplicated in first-seen order.
     pub fn cwds(&self) -> Vec<PathBuf> {
         let mut seen: Vec<PathBuf> = Vec::new();
-        for c in self.calls.borrow().iter() {
+        for c in self.calls.lock().unwrap().iter() {
             if !seen.contains(&c.cwd) {
                 seen.push(c.cwd.clone());
             }
@@ -139,7 +147,7 @@ impl RecordingRunner {
 
 impl CommandRunner for RecordingRunner {
     fn run(&self, inv: &Invocation) -> std::io::Result<Outcome> {
-        self.calls.borrow_mut().push(inv.clone());
+        self.calls.lock().unwrap().push(inv.clone());
         let fail = self.fail_when.as_ref().map(|f| f(inv)).unwrap_or(false);
         Ok(Outcome {
             success: !fail,

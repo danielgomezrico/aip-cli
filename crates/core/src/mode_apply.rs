@@ -2,6 +2,7 @@
 
 use crate::modes::Resolution;
 use crate::runner::{CommandRunner, Invocation};
+use rayon::prelude::*;
 use std::path::Path;
 
 /// Which host CLI receives the `plugin enable/disable` calls.
@@ -69,26 +70,33 @@ pub struct Action {
 }
 
 /// Apply `resolution` against `target`, running `<prog> plugin enable|disable`
-/// for every plugin in canonical order. Failures of individual enable/disable
+/// for every plugin in parallel. Failures of individual enable/disable
 /// calls are tolerated (matching the original `|| true`); the returned vec lists
-/// the actions taken in order.
-pub fn apply_mode<R: CommandRunner>(
+/// the actions taken in canonical order.
+pub fn apply_mode<R: CommandRunner + Send + Sync + ?Sized>(
     resolution: &Resolution,
     target: Target,
     cwd: &Path,
     runner: &R,
 ) -> std::io::Result<Vec<Action>> {
     let (on, _off) = resolution.partition();
-    let mut actions = Vec::new();
-    for &plugin in crate::modes::ALL_PLUGINS {
-        let enable = on.contains(&plugin);
-        let verb = if enable { "enable" } else { "disable" };
-        let inv = Invocation::new(target.program(), &["plugin", verb, plugin], cwd);
-        // Tolerate failures, like the Makefile's `|| true`.
-        let _ = runner.run(&inv)?;
-        actions.push(Action { plugin, enable });
-    }
-    Ok(actions)
+    let cwd_owned = cwd.to_path_buf();
+
+    let actions: std::io::Result<Vec<_>> = crate::modes::all_plugins()
+        .par_iter()
+        .map(|&plugin| {
+            let enable = on.contains(&plugin);
+            let verb = if enable { "enable" } else { "disable" };
+            let inv = Invocation::new(target.program(), &["plugin", verb, plugin], &cwd_owned);
+            let _ = runner.run(&inv)?;
+            Ok(Action { plugin, enable })
+        })
+        .collect();
+
+    let mut result = actions?;
+    // Restore canonical order.
+    result.sort_by_key(|a| crate::modes::all_plugins().iter().position(|&p| p == a.plugin).unwrap_or(0));
+    Ok(result)
 }
 
 /// The result of applying a mode to one agent.
@@ -98,20 +106,28 @@ pub struct TargetReport {
     pub actions: Vec<Action>,
 }
 
-/// Apply `resolution` to every agent in `targets`, in order. Returns one report
-/// per agent. An empty `targets` is a no-op (caller should warn).
-pub fn apply_targets<R: CommandRunner>(
+/// Apply `resolution` to every agent in `targets` in parallel. Returns one report
+/// per agent in the same order as `targets`. An empty `targets` is a no-op (caller should warn).
+pub fn apply_targets<R: CommandRunner + Send + Sync + ?Sized>(
     resolution: &Resolution,
     targets: &[Target],
     cwd: &Path,
     runner: &R,
 ) -> std::io::Result<Vec<TargetReport>> {
-    let mut reports = Vec::new();
-    for &target in targets {
-        let actions = apply_mode(resolution, target, cwd, runner)?;
-        reports.push(TargetReport { target, actions });
-    }
-    Ok(reports)
+    let cwd_owned = cwd.to_path_buf();
+
+    let reports: std::io::Result<Vec<_>> = targets
+        .par_iter()
+        .map(|&target| {
+            let actions = apply_mode(resolution, target, &cwd_owned, runner)?;
+            Ok(TargetReport { target, actions })
+        })
+        .collect();
+
+    let mut result = reports?;
+    // Restore order matching input `targets`.
+    result.sort_by_key(|r| targets.iter().position(|&t| t == r.target).unwrap_or(0));
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -129,13 +145,20 @@ mod tests {
             apply_mode(&res, Target::ClaudeCode, &PathBuf::from("/repo"), &runner).unwrap();
 
         // One call per plugin.
-        assert_eq!(runner.lines().len(), crate::modes::ALL_PLUGINS.len());
-        assert_eq!(actions.len(), crate::modes::ALL_PLUGINS.len());
+        assert_eq!(runner.lines().len(), crate::modes::all_plugins().len());
+        assert_eq!(actions.len(), crate::modes::all_plugins().len());
 
-        // ai-architecture + software-engineer enabled, rest disabled.
-        assert_eq!(runner.lines()[0], "claude plugin enable ai-architecture");
-        assert_eq!(runner.lines()[1], "claude plugin enable software-engineer");
-        assert_eq!(runner.lines()[2], "claude plugin disable flutter-pivara");
+        // Actions are returned in canonical order.
+        assert_eq!(actions[0].enable, true);
+        assert_eq!(actions[0].plugin, "ai-architecture");
+        assert_eq!(actions[1].enable, true);
+        assert_eq!(actions[1].plugin, "software-engineer");
+
+        // Check runner was called for each plugin (order may vary due to parallel execution).
+        let lines = runner.lines();
+        assert!(lines.iter().any(|l| l == "claude plugin enable ai-architecture"));
+        assert!(lines.iter().any(|l| l == "claude plugin enable software-engineer"));
+        assert!(lines.iter().any(|l| l == "claude plugin disable flutter"));
     }
 
     #[test]
@@ -177,7 +200,7 @@ mod tests {
         assert_eq!(reports[0].target, Target::ClaudeCode);
         assert_eq!(reports[1].target, Target::Grok);
         // Each agent got one call per plugin.
-        let n = crate::modes::ALL_PLUGINS.len();
+        let n = crate::modes::all_plugins().len();
         assert_eq!(runner.lines().len(), 2 * n);
         assert!(runner
             .lines()

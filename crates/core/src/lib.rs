@@ -24,5 +24,5 @@ pub use doctor::{build_report, render as render_doctor, DoctorReport};
 pub use ingest::{ingest_folder, ingest_url, Ingested};
 pub use manifest::PluginManifest;
 pub use mode_apply::{apply_mode, Target};
-pub use modes::{resolve, Mode, ModeError, ALL_PLUGINS};
+pub use modes::{resolve, Mode, ModeError, all_plugins, get_plugin_metadata, Role, Domain, PluginMetadata};
 pub use runner::{CommandRunner, RecordingRunner, SystemRunner};

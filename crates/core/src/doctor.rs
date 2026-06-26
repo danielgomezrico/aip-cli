@@ -215,7 +215,7 @@ pub fn build_report(
             // Drift over the managed plugin universe only, so agent-specific
             // extras (e.g. plugins outside any mode) never count as drift.
             let drift = targeted
-                && modes::ALL_PLUGINS.iter().any(|p| {
+                && modes::all_plugins().iter().any(|p| {
                     let want = wants.iter().any(|w| w == p);
                     want != state.is_enabled(p)
                 });
