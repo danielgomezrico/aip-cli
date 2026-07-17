@@ -22,6 +22,7 @@
 //! hand-maintained, so they never duplicate or drift, and a newly categorized
 //! ingested plugin automatically appears in the modes its facets imply.
 
+use crate::arg_enum::ArgEnum;
 use std::sync::OnceLock;
 use thiserror::Error;
 
@@ -59,7 +60,13 @@ impl Role {
 
     /// Parse a role from its string form (accepts a few friendly aliases).
     pub fn parse(s: &str) -> Option<Role> {
-        match s.trim().to_ascii_lowercase().as_str() {
+        <Role as ArgEnum>::parse(s)
+    }
+}
+
+impl ArgEnum for Role {
+    fn from_normalized(token: &str) -> Option<Role> {
+        match token {
             "architect" => Some(Role::Architect),
             "engineer" => Some(Role::Engineer),
             "product-manager" | "product" | "pm" => Some(Role::ProductManager),
@@ -104,7 +111,13 @@ impl Domain {
 
     /// Parse a domain from its string form (accepts a few friendly aliases).
     pub fn parse(s: &str) -> Option<Domain> {
-        match s.trim().to_ascii_lowercase().as_str() {
+        <Domain as ArgEnum>::parse(s)
+    }
+}
+
+impl ArgEnum for Domain {
+    fn from_normalized(token: &str) -> Option<Domain> {
+        match token {
             "general" | "any" => Some(Domain::General),
             "web" | "frontend" => Some(Domain::Web),
             "mobile" => Some(Domain::Mobile),

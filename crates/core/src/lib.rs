@@ -6,6 +6,7 @@
 //! trait, which has both a real and a recording implementation.
 
 pub mod agent_state;
+pub mod arg_enum;
 pub mod categories;
 pub mod config;
 pub mod discovery;
@@ -20,6 +21,7 @@ pub mod setup;
 pub mod store;
 
 pub use agent_state::{read_state, AgentPlugins};
+pub use arg_enum::ArgEnum;
 pub use discovery::{discover_plugins, Plugin};
 pub use doctor::{build_report, render as render_doctor, DoctorReport};
 pub use ingest::{ingest_folder, ingest_url, Ingested};

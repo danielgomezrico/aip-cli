@@ -1,5 +1,6 @@
 //! Applying a resolved mode by enabling/disabling plugins via the host CLI.
 
+use crate::arg_enum::ArgEnum;
 use crate::modes::Resolution;
 use crate::runner::{CommandRunner, Invocation};
 use crate::store;
@@ -37,11 +38,7 @@ impl Target {
 
     /// Parse a target from its key (`claude` / `grok`).
     pub fn parse(s: &str) -> Option<Target> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "claude" | "claude-code" | "claudecode" => Some(Target::ClaudeCode),
-            "grok" => Some(Target::Grok),
-            _ => None,
-        }
+        <Target as ArgEnum>::parse(s)
     }
 
     /// Human label used in logs (matches the original `mode` / `mode-grok`).
@@ -49,6 +46,16 @@ impl Target {
         match self {
             Target::ClaudeCode => "mode",
             Target::Grok => "mode-grok",
+        }
+    }
+}
+
+impl ArgEnum for Target {
+    fn from_normalized(token: &str) -> Option<Target> {
+        match token {
+            "claude" | "claude-code" | "claudecode" => Some(Target::ClaudeCode),
+            "grok" => Some(Target::Grok),
+            _ => None,
         }
     }
 }

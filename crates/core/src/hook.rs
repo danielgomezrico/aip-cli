@@ -2,6 +2,7 @@
 //! marker, a direnv-style trust store, and pure decision helpers kept for
 //! doctor/compat.
 
+use crate::arg_enum::ArgEnum;
 use crate::config::{config_dir, MARKER_NAME};
 use crate::mode_apply::Target;
 use serde::Deserialize;
@@ -17,7 +18,13 @@ pub enum Shell {
 
 impl Shell {
     pub fn parse(s: &str) -> Option<Shell> {
-        match s.trim().to_ascii_lowercase().as_str() {
+        <Shell as ArgEnum>::parse(s)
+    }
+}
+
+impl ArgEnum for Shell {
+    fn from_normalized(token: &str) -> Option<Shell> {
+        match token {
             "bash" => Some(Shell::Bash),
             "zsh" => Some(Shell::Zsh),
             _ => None,
