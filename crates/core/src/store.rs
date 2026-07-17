@@ -395,4 +395,83 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn read_subdirs_on_file_path_returns_err() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("just-a-file.txt");
+        fs::write(&file, "x").unwrap();
+        assert!(read_subdirs(&file).is_err());
+    }
+
+    #[test]
+    fn read_plugin_dirs_on_file_path_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("just-a-file.txt");
+        fs::write(&file, "x").unwrap();
+        assert_eq!(read_plugin_dirs(&file), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn read_subdirs_sorts_by_byte_lexicographic_order() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("plugin2")).unwrap();
+        fs::create_dir_all(tmp.path().join("plugin10")).unwrap();
+        fs::create_dir_all(tmp.path().join("alpha")).unwrap();
+        fs::create_dir_all(tmp.path().join("Zeta")).unwrap();
+
+        let got = read_subdirs(tmp.path()).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                tmp.path().join("Zeta"),
+                tmp.path().join("alpha"),
+                tmp.path().join("plugin10"),
+                tmp.path().join("plugin2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_plugin_dirs_does_not_descend_into_nested_plugin_dir() {
+        let tmp = TempDir::new().unwrap();
+        make_plugin(&tmp.path().join("immediate-plugin"), "immediate");
+        // "outer" is NOT itself a plugin dir, but its child "nested-plugin" is.
+        make_plugin(&tmp.path().join("outer").join("nested-plugin"), "nested");
+
+        let got = read_plugin_dirs(tmp.path());
+        assert_eq!(got, vec![tmp.path().join("immediate-plugin")]);
+    }
+
+    #[test]
+    fn read_plugin_dirs_excludes_partial_marker_and_dir_named_plugin_json() {
+        let tmp = TempDir::new().unwrap();
+        make_plugin(&tmp.path().join("valid-plugin"), "valid");
+        // Has .claude-plugin/ but no plugin.json inside it.
+        fs::create_dir_all(tmp.path().join("partial").join(".claude-plugin")).unwrap();
+        // plugin.json exists but is a directory, not a file.
+        fs::create_dir_all(
+            tmp.path()
+                .join("dir-not-file")
+                .join(".claude-plugin")
+                .join("plugin.json"),
+        )
+        .unwrap();
+
+        let got = read_plugin_dirs(tmp.path());
+        assert_eq!(got, vec![tmp.path().join("valid-plugin")]);
+    }
+
+    #[test]
+    fn read_subdirs_includes_hidden_dotfile_subdirs() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join(".hidden")).unwrap();
+        fs::create_dir_all(tmp.path().join("visible")).unwrap();
+
+        let got = read_subdirs(tmp.path()).unwrap();
+        assert_eq!(
+            got,
+            vec![tmp.path().join(".hidden"), tmp.path().join("visible")]
+        );
+    }
 }
