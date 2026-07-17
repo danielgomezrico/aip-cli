@@ -6,6 +6,7 @@
 //! directory name, skipping anything missing a manifest or Makefile.
 
 use crate::manifest::PluginManifest;
+use crate::store::read_subdirs;
 use std::path::{Path, PathBuf};
 
 /// A discovered plugin.
@@ -34,12 +35,7 @@ pub fn plugins_root(repo_root: &Path) -> PathBuf {
 
 /// Discover all plugins under `plugins_root`, sorted by directory name.
 pub fn discover_plugins(plugins_root: &Path) -> std::io::Result<Vec<Plugin>> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(plugins_root)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    entries.sort();
+    let entries: Vec<PathBuf> = read_subdirs(plugins_root)?;
 
     let mut plugins = Vec::new();
     for dir in entries {

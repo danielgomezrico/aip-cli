@@ -9,7 +9,9 @@
 //! testable without touching the network.
 
 use crate::runner::{CommandRunner, Invocation};
-use crate::store::{install_plugin, install_plugin_with, is_plugin_dir, store_name, StoreConflict};
+use crate::store::{
+    install_plugin, install_plugin_with, is_plugin_dir, read_subdirs, store_name, StoreConflict,
+};
 use std::path::{Path, PathBuf};
 
 /// One plugin copied into the store.
@@ -38,12 +40,7 @@ pub fn ingest_folder_with(
     plugins_root: &Path,
     on_conflict: &mut dyn FnMut(&StoreConflict) -> bool,
 ) -> std::io::Result<Vec<Ingested>> {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(folder)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    dirs.sort();
+    let dirs: Vec<PathBuf> = read_subdirs(folder)?;
 
     let mut out = Vec::new();
     for dir in dirs {
@@ -100,12 +97,10 @@ pub fn find_plugin(checkout: &Path) -> std::io::Result<PathBuf> {
     if is_plugin_dir(checkout) {
         return Ok(checkout.to_path_buf());
     }
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(checkout)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir() && is_plugin_dir(p))
+    let mut candidates: Vec<PathBuf> = read_subdirs(checkout)?
+        .into_iter()
+        .filter(|p| is_plugin_dir(p))
         .collect();
-    candidates.sort();
     match candidates.len() {
         0 => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

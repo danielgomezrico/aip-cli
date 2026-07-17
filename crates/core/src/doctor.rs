@@ -10,7 +10,7 @@ use crate::hook::{content_hash, Marker, MarkerTarget};
 use crate::manifest::PluginManifest;
 use crate::mode_apply::Target;
 use crate::modes;
-use crate::store::is_plugin_dir;
+use crate::store::read_plugin_dirs;
 use std::path::{Path, PathBuf};
 
 // ─── inputs (gathered by the CLI) ────────────────────────────────────────────
@@ -33,15 +33,7 @@ pub struct StorePlugin {
 /// an unknown (`"?"`) version so it still shows up rather than silently
 /// vanishing.
 pub fn scan_store(plugins_root: &Path) -> Vec<StorePlugin> {
-    let mut dirs: Vec<PathBuf> = match std::fs::read_dir(plugins_root) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir() && is_plugin_dir(p))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    dirs.sort();
+    let dirs: Vec<PathBuf> = read_plugin_dirs(plugins_root);
     let mut out: Vec<StorePlugin> = dirs
         .iter()
         .map(|d| match PluginManifest::read(d) {

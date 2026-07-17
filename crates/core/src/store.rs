@@ -34,6 +34,37 @@ pub fn store_name(src: &Path) -> Option<String> {
     src.file_name().and_then(|s| s.to_str()).map(str::to_string)
 }
 
+/// Sorted immediate subdirectories of `dir` (files are excluded). Propagates
+/// the `read_dir` error (e.g. a missing or unreadable `dir`) to the caller.
+pub fn read_subdirs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    Ok(dirs)
+}
+
+/// Sorted immediate subdirectories of `dir` that are plugin dirs (see
+/// [`is_plugin_dir`]). A missing or unreadable `dir` yields an empty list
+/// rather than an error — callers that want to tolerate an absent store use
+/// this instead of [`read_subdirs`].
+pub fn read_plugin_dirs(dir: &Path) -> Vec<PathBuf> {
+    match std::fs::read_dir(dir) {
+        Ok(rd) => {
+            let mut dirs: Vec<PathBuf> = rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir() && is_plugin_dir(p))
+                .collect();
+            dirs.sort();
+            dirs
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Recursively copy `src` into `dest`, creating `dest` and any parents. The
 /// `.git` directory is skipped so ingested checkouts don't carry VCS metadata.
 ///
@@ -306,5 +337,62 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         let err = install_plugin(&src, &tmp.path().join("store")).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn read_subdirs_empty_dir_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(read_subdirs(tmp.path()).unwrap(), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn read_subdirs_excludes_files_and_sorts_ascending() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("zeta")).unwrap();
+        fs::create_dir_all(tmp.path().join("alpha")).unwrap();
+        fs::create_dir_all(tmp.path().join("mid")).unwrap();
+        fs::write(tmp.path().join("not-a-dir.txt"), "x").unwrap();
+
+        let got = read_subdirs(tmp.path()).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                tmp.path().join("alpha"),
+                tmp.path().join("mid"),
+                tmp.path().join("zeta"),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_subdirs_missing_path_propagates_err() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert!(read_subdirs(&missing).is_err());
+    }
+
+    #[test]
+    fn read_plugin_dirs_missing_path_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert_eq!(read_plugin_dirs(&missing), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn read_plugin_dirs_filters_out_non_plugin_subdirs_and_sorts() {
+        let tmp = TempDir::new().unwrap();
+        make_plugin(&tmp.path().join("zeta-plugin"), "zeta");
+        make_plugin(&tmp.path().join("alpha-plugin"), "alpha");
+        fs::create_dir_all(tmp.path().join("not-a-plugin")).unwrap();
+        fs::write(tmp.path().join("some-file.txt"), "x").unwrap();
+
+        let got = read_plugin_dirs(tmp.path());
+        assert_eq!(
+            got,
+            vec![
+                tmp.path().join("alpha-plugin"),
+                tmp.path().join("zeta-plugin"),
+            ]
+        );
     }
 }

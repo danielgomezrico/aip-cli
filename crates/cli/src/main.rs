@@ -470,15 +470,7 @@ fn looks_like_git_url(s: &str) -> bool {
 
 fn cmd_list_plugins() -> Result<()> {
     let root = store::plugins_dir();
-    let mut dirs: Vec<PathBuf> = match std::fs::read_dir(&root) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir() && store::is_plugin_dir(p))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    dirs.sort();
+    let dirs: Vec<PathBuf> = store::read_plugin_dirs(&root);
     if dirs.is_empty() {
         println!("(no plugins in {})", root.display());
         println!("  ingest some with: aip-cli ingest <folder-or-git-url>");
