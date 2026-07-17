@@ -136,11 +136,52 @@ where
     Ok(steps)
 }
 
+/// Outcome counts for host-side package installs (e.g. `pi install`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostInstallReport {
+    /// Invocations issued (`ok + failed`).
+    pub attempted: usize,
+    pub ok: usize,
+    /// `outcome.success == false` or `runner.run` returned `Err`.
+    pub failed: usize,
+    /// Canonicalize failed / path missing — no invocation.
+    pub skipped: usize,
+}
+
+/// Sequential `pi install <canonical-abs>` for each plugin.
+///
+/// Caller gates PATH. No `Target`, no `-l`/`--trust`. Continues on install
+/// failure. Does not call `is_on_path`.
+pub fn install_pi_packages<R: CommandRunner>(
+    plugins: &[Plugin],
+    runner: &R,
+) -> HostInstallReport {
+    let mut report = HostInstallReport::default();
+    for p in plugins {
+        let abs = match std::fs::canonicalize(&p.path) {
+            Ok(path) => path,
+            Err(_) => {
+                report.skipped += 1;
+                continue;
+            }
+        };
+        let abs_str = abs.to_string_lossy().into_owned();
+        let inv = Invocation::new("pi", &["install", abs_str.as_str()], &abs);
+        report.attempted += 1;
+        match runner.run(&inv) {
+            Ok(out) if out.success => report.ok += 1,
+            Ok(_) | Err(_) => report.failed += 1,
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::RecordingRunner;
+    use crate::runner::{CommandRunner, Invocation, Outcome, RecordingRunner};
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     fn plugin(name: &str, prepare: bool) -> Plugin {
         Plugin {
@@ -149,6 +190,38 @@ mod tests {
             version: "1.0.0".to_string(),
             has_prepare: prepare,
             path: PathBuf::from(format!("/repo/plugins/{name}")),
+        }
+    }
+
+    fn temp_plugin(name: &str, dir: &std::path::Path) -> Plugin {
+        let path = dir.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        Plugin {
+            dir_name: name.to_string(),
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            has_prepare: false,
+            path,
+        }
+    }
+
+    /// Returns `Err` for every inv — exercises the `run` error branch.
+    struct ErrRunner {
+        calls: Mutex<Vec<Invocation>>,
+    }
+
+    impl ErrRunner {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CommandRunner for ErrRunner {
+        fn run(&self, inv: &Invocation) -> std::io::Result<Outcome> {
+            self.calls.lock().unwrap().push(inv.clone());
+            Err(std::io::Error::other("forced"))
         }
     }
 
@@ -222,5 +295,112 @@ mod tests {
         let runner = RecordingRunner::failing(|_| true);
         let steps = run_install(&plugins, &runner, |_| false).unwrap();
         assert_eq!(steps[0].status, "fail");
+    }
+
+    #[test]
+    fn pi_install_emits_abs_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let plugins = vec![
+            temp_plugin("a", tmp.path()),
+            temp_plugin("b", tmp.path()),
+        ];
+        let runner = RecordingRunner::new();
+        let report = install_pi_packages(&plugins, &runner);
+        assert_eq!(report.ok, 2);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.attempted, 2);
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+        for (i, p) in plugins.iter().enumerate() {
+            let abs = std::fs::canonicalize(&p.path).unwrap();
+            assert_eq!(calls[i].program, "pi");
+            assert_eq!(calls[i].args, vec!["install".to_string(), abs.to_string_lossy().into_owned()]);
+            assert!(Path::new(&calls[i].args[1]).is_absolute());
+            assert_eq!(calls[i].cwd, abs);
+        }
+    }
+
+    #[test]
+    fn pi_install_relative_path_becomes_abs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let name = "relplug";
+        let abs_dir = tmp.path().join(name);
+        std::fs::create_dir_all(&abs_dir).unwrap();
+        // Non-canonical absolute path with `.` / `..` components → canonicalize to abs.
+        let mut p = temp_plugin(name, tmp.path());
+        p.path = abs_dir.join(".").join("..").join(name);
+        let runner = RecordingRunner::new();
+        let report = install_pi_packages(&[p], &runner);
+        assert_eq!(report.ok, 1);
+        assert_eq!(report.skipped, 0);
+        let arg = &runner.calls()[0].args[1];
+        assert!(Path::new(arg).is_absolute());
+        assert!(!arg.contains("/./") && !arg.contains("/../"));
+        assert_eq!(
+            Path::new(arg),
+            std::fs::canonicalize(tmp.path().join(name)).unwrap()
+        );
+    }
+
+    #[test]
+    fn pi_install_skips_missing_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let good = temp_plugin("good", tmp.path());
+        let bad = Plugin {
+            dir_name: "missing".into(),
+            name: "missing".into(),
+            version: "1.0.0".into(),
+            has_prepare: false,
+            path: tmp.path().join("does-not-exist"),
+        };
+        let runner = RecordingRunner::new();
+        let report = install_pi_packages(&[good.clone(), bad], &runner);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.ok, 1);
+        assert_eq!(report.attempted, 1);
+        assert_eq!(runner.calls().len(), 1);
+        assert_eq!(
+            runner.calls()[0].args[1],
+            std::fs::canonicalize(&good.path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+    }
+
+    #[test]
+    fn pi_install_counts_runner_failures() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let plugins = vec![
+            temp_plugin("a", tmp.path()),
+            temp_plugin("b", tmp.path()),
+        ];
+        let runner = RecordingRunner::failing(|_| true);
+        let report = install_pi_packages(&plugins, &runner);
+        assert_eq!(report.failed, 2);
+        assert_eq!(report.attempted, 2);
+        assert_eq!(report.ok, 0);
+        assert_eq!(report.skipped, 0);
+    }
+
+    #[test]
+    fn pi_install_counts_run_err() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let plugins = vec![temp_plugin("a", tmp.path())];
+        let runner = ErrRunner::new();
+        let report = install_pi_packages(&plugins, &runner);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.ok, 0);
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pi_install_empty() {
+        let runner = RecordingRunner::new();
+        let report = install_pi_packages(&[], &runner);
+        assert_eq!(report, HostInstallReport::default());
+        assert!(runner.calls().is_empty());
     }
 }
