@@ -115,4 +115,43 @@ mod tests {
         let got = canonicalize_or_self(missing.clone());
         assert_eq!(got, missing);
     }
+
+    #[test]
+    fn canonicalize_dir_succeeds_for_existing_file_not_dir() {
+        // `canonicalize_dir` delegates to `Path::canonicalize`, which resolves
+        // any existing path regardless of whether it's a file or a directory.
+        // Despite the "dir" in its name, it does NOT reject files.
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("existing.txt");
+        fs::write(&file, b"contents").unwrap();
+        let got = canonicalize_dir(&file).unwrap();
+        assert_eq!(got, file.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn canonicalize_or_self_canonicalizes_existing_dir() {
+        // The tolerant-fallback branch (missing path) is covered above; this
+        // locks the happy branch so a regression that always echoed the input
+        // unchanged (defeating the point of canonicalization) would fail.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("existing");
+        fs::create_dir_all(&dir).unwrap();
+        let got = canonicalize_or_self(dir.clone());
+        assert_eq!(got, dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn canonicalize_dir_resolves_dot_components_to_canonical_absolute_path() {
+        // Proves the function actually resolves the filesystem (not a
+        // passthrough) via `.`/`..` components, without mutating process cwd
+        // (flaky under parallel tests) or asserting a hardcoded absolute
+        // path string (fragile on macOS's /private symlink).
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("nested");
+        fs::create_dir_all(&dir).unwrap();
+        let messy = tmp.path().join(".").join("nested").join("..").join("nested");
+        let got = canonicalize_dir(&messy).unwrap();
+        assert!(got.is_absolute());
+        assert_eq!(got, dir.canonicalize().unwrap());
+    }
 }
