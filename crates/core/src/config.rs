@@ -1,5 +1,6 @@
 //! Filesystem locations: repo root discovery and the per-user config directory.
 
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// Name of the per-directory marker that records the mode for `aip-cli enable`.
@@ -26,6 +27,19 @@ pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
         }
     }
     best_git
+}
+
+/// Canonicalize `path`, mapping a failure to a clear "no such directory" error.
+pub fn canonicalize_dir(path: &Path) -> Result<PathBuf> {
+    path.canonicalize()
+        .with_context(|| format!("no such directory: {path:?}"))
+}
+
+/// Canonicalize `path`, falling back to `path` unchanged if it doesn't exist
+/// or canonicalization otherwise fails. For call sites that tolerate a
+/// missing directory rather than surfacing an error.
+pub fn canonicalize_or_self(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
 }
 
 #[cfg(test)]
@@ -73,5 +87,32 @@ mod tests {
     #[test]
     fn config_dir_ends_with_aip_cli() {
         assert!(config_dir().ends_with("aip-cli"));
+    }
+
+    #[test]
+    fn canonicalize_dir_returns_canonical_path_for_existing_dir() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("existing");
+        fs::create_dir_all(&dir).unwrap();
+        let got = canonicalize_dir(&dir).unwrap();
+        assert_eq!(got, dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn canonicalize_dir_surfaces_fixed_message_on_missing_path() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let err = canonicalize_dir(&missing).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains(&format!("no such directory: {missing:?}")));
+    }
+
+    #[test]
+    fn canonicalize_or_self_returns_input_unchanged_on_missing_path() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let got = canonicalize_or_self(missing.clone());
+        assert_eq!(got, missing);
     }
 }

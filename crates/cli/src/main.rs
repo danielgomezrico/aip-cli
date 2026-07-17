@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use aip_core::agent_state::read_state;
 use aip_core::categories;
-use aip_core::config::{config_dir, find_repo_root, MARKER_NAME};
+use aip_core::config::{canonicalize_dir, canonicalize_or_self, config_dir, find_repo_root, MARKER_NAME};
 use aip_core::discovery::{discover_plugins, plugins_root};
 use aip_core::doctor::{self, AgentInput, ProjectInput, StorePlugin};
 use aip_core::hook::{
@@ -181,9 +181,7 @@ fn cmd_setup(repo: Option<PathBuf>, from: Option<String>, verbose: bool) -> Resu
             let _ = ingest_url(&source, &store::plugins_dir(), &runner)?;
         } else {
             let folder = PathBuf::from(source);
-            let folder = folder
-                .canonicalize()
-                .with_context(|| format!("no such folder: {folder:?}"))?;
+            let folder = canonicalize_dir(&folder)?;
             let dest = store::plugins_dir();
             std::fs::create_dir_all(&dest)
                 .with_context(|| format!("creating store {}", dest.display()))?;
@@ -280,9 +278,7 @@ fn cmd_mode(
 
 /// Apply the mode from the nearest `.aip-cli.toml` under `dir` (manual only).
 fn cmd_enable(dir: PathBuf, verbose: bool) -> Result<()> {
-    let here = dir
-        .canonicalize()
-        .with_context(|| format!("no such directory: {dir:?}"))?;
+    let here = canonicalize_dir(&dir)?;
     let marker_path = find_marker(&here).ok_or_else(|| {
         anyhow!(
             "no {MARKER_NAME} found above {here:?}\n  pick a mode first: aip-cli mode <name>"
@@ -425,9 +421,7 @@ fn persist_marker(selector: &str, only: Option<String>, dir: PathBuf) -> Result<
         None => None,
     };
 
-    let dir = dir
-        .canonicalize()
-        .with_context(|| format!("no such directory: {dir:?}"))?;
+    let dir = canonicalize_dir(&dir)?;
     let marker = dir.join(MARKER_NAME);
     let body = Marker::render(selector, target);
     std::fs::write(&marker, &body).with_context(|| format!("writing {}", marker.display()))?;
@@ -495,7 +489,7 @@ fn scan_store() -> Vec<StorePlugin> {
 }
 
 fn cmd_doctor(dir: PathBuf) -> Result<()> {
-    let here = dir.canonicalize().unwrap_or(dir);
+    let here = canonicalize_or_self(dir);
     let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
 
     // Project marker state — cheap local reads.
@@ -588,7 +582,7 @@ fn cmd_completion(shell: CompleteShell) -> Result<()> {
 }
 
 fn cmd_trust(dir: PathBuf, allow: bool) -> Result<()> {
-    let dir = dir.canonicalize().with_context(|| format!("{dir:?}"))?;
+    let dir = canonicalize_dir(&dir)?;
     let marker = dir.join(MARKER_NAME);
     let marker_str = marker.to_string_lossy().to_string();
     let mut store = TrustStore::load();
