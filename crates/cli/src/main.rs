@@ -1,26 +1,28 @@
-//! `aip-cli` — install, switch, and auto-activate plugin modes.
+//! `aip-cli` — install and switch Claude Code / Grok plugin modes.
 //!
 //! This binary is intentionally thin: argument parsing and I/O only. All logic
 //! lives in `aip_core` so it can be unit-tested without side effects.
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{builder::PossibleValuesParser, CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell as CompleteShell};
 use std::io::Write;
 use std::path::PathBuf;
 
 use aip_core::agent_state::read_state;
-use aip_core::config::{find_repo_root, MARKER_NAME};
+use aip_core::categories;
+use aip_core::config::{config_dir, find_repo_root, MARKER_NAME};
 use aip_core::discovery::{discover_plugins, plugins_root};
 use aip_core::doctor::{self, AgentInput, ProjectInput, StorePlugin};
 use aip_core::hook::{
-    self, content_hash, find_marker, hook_script, load_applied_hash, save_applied_hash, AutoAction,
-    Marker, MarkerTarget, Shell, TrustStore,
+    content_hash, find_marker, hook_script, load_applied_hash, save_applied_hash, Marker,
+    MarkerTarget, Shell, TrustStore,
 };
 use aip_core::ingest::{ingest_folder_with, ingest_url};
 use aip_core::manifest::PluginManifest;
-use aip_core::mode_apply::{apply_targets, available, Target, ALL_TARGETS};
+use aip_core::mode_apply::{apply_targets, available, is_on_path, Target, ALL_TARGETS};
 use aip_core::modes::{self, resolve};
-use aip_core::runner::SystemRunner;
+use aip_core::runner::{CommandRunner, Invocation, SystemRunner};
 use aip_core::setup::{is_linked, run_setup};
 use aip_core::store;
 
@@ -28,76 +30,72 @@ use aip_core::store;
 #[command(
     name = "aip-cli",
     version,
-    about = "Install, switch, and auto-activate Claude Code / Grok plugin modes."
+    about = "Install and switch Claude Code / Grok plugin modes per folder."
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Print each `claude/grok plugin enable|disable` call, its exit code, and
+    /// its output — so failures (e.g. a plugin the agent doesn't know) are
+    /// visible instead of silently tolerated.
+    #[arg(short = 'v', long, global = true)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Run prepare + install across all discovered plugins.
+    ///
+    /// Optionally ingest plugins from a local folder or git URL first.
+    /// If a plugin with the same name already exists in the store, it is replaced.
     Setup {
         /// Repo root (defaults to discovery from the current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
+        /// Git URL or local folder to ingest before setup.
+        #[arg(long)]
+        from: Option<String>,
     },
-    /// Enable a curated subset of plugins across every installed AI agent.
+    /// Pick a mode, apply it now, and remember it for this folder.
+    ///
+    /// Applies the mode to every installed AI agent, then writes a
+    /// `.aip-cli.toml` marker so you can re-apply later with `aip-cli enable`.
+    /// Pass `--no-save` for a one-off apply that writes no marker.
     Mode {
         /// Mode selectors (names or 1-based numbers). Omit for an interactive picker.
         selectors: Vec<String>,
-        /// Restrict to a single agent (`claude` or `grok`). Default: all installed.
+        /// Restrict to a single agent (`claude` or `grok`) and pin the marker to
+        /// it. Default: all installed agents.
         #[arg(long)]
         only: Option<String>,
-    },
-    /// Write a `.aip-cli.toml` marker in a folder and trust it so the mode
-    /// auto-activates on cd.
-    ///
-    /// The marker is allowed right after it is written, so no separate
-    /// `aip-cli allow` step is needed. By default the marker has no agent
-    /// pinned, so the mode applies to every installed AI agent.
-    Init {
-        /// Mode selectors (names or numbers). Omit for an interactive picker.
-        selectors: Vec<String>,
-        /// Pin the marker to a single agent (`claude` or `grok`). Default: all.
-        #[arg(long)]
-        only: Option<String>,
-        /// Folder to write the marker into (defaults to the current directory).
+        /// Folder to remember the mode in (defaults to the current directory).
         #[arg(long, default_value = ".")]
         dir: PathBuf,
-        /// Overwrite an existing marker.
+        /// Apply once without writing or trusting a marker.
         #[arg(long)]
-        force: bool,
+        no_save: bool,
     },
-    /// Copy every plugin found in FOLDER's subdirectories into the .aip-cli store.
+    /// Apply the mode recorded in this folder's `.aip-cli.toml`.
     ///
-    /// FOLDER is a directory whose immediate subdirectories are each a Claude
-    /// plugin (have a `.claude-plugin/plugin.json`). Non-plugin subdirs are
-    /// skipped.
-    IngestFolder {
-        /// Folder whose subdirectories are each a Claude plugin.
-        folder: PathBuf,
-        /// Overwrite an occupied store slot without prompting when a different
-        /// plugin already holds it.
-        #[arg(long, short = 'y')]
-        force: bool,
+    /// Looks up the nearest marker from DIR (default: cwd), then enables that
+    /// mode on the installed agents. Does nothing on `cd` — you run this by hand.
+    Enable {
+        /// Folder to resolve the marker from (defaults to the current directory).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
     },
-    /// Clone a plugin from a git URL into the .aip-cli store.
-    IngestUrl {
-        /// Git URL of a repository containing a single Claude plugin.
-        url: String,
+    /// List the available modes, or the store's plugins with `--plugins`.
+    List {
+        /// List the plugins held in the .aip-cli store instead of the modes.
+        #[arg(long)]
+        plugins: bool,
     },
-    /// List the plugins currently held in the .aip-cli store.
-    ListPlugins,
-    /// List the available modes and the plugins each enables.
-    ListModes,
-    /// Print the shell hook to add to your rc file (bash or zsh).
+    /// Print a no-op shell hook (auto-on-cd is disabled; use `aip-cli enable`).
     Hook {
         /// Shell to emit a hook for.
         shell: String,
     },
-    /// Trust the marker in DIR (or the current dir) for auto-activation.
+    /// Trust the marker in DIR (or the current dir). Kept for doctor/compat.
     Allow {
         #[arg(default_value = ".")]
         dir: PathBuf,
@@ -117,30 +115,47 @@ enum Command {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
     },
-    /// Internal: invoked by the shell hook on each `cd`.
+    /// Generate shell completion scripts (bash, zsh, fish, ...).
+    /// See `aip-cli completion --help` or the README for install instructions per shell.
+    Completion {
+        /// Target shell.
+        #[arg(value_enum)]
+        shell: CompleteShell,
+    },
+
+    /// Internal no-op: former shell-hook entrypoint. Auto-on-cd is disabled.
+    #[command(hide = true)]
     Auto,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Merge persisted categories for ingested plugins over the built-in catalog,
+    // so they participate in modes/doctor just like built-ins.
+    modes::set_overlay(categories::load(&config_dir()));
+    let verbose = cli.verbose;
     match cli.command {
-        Command::Setup { repo } => cmd_setup(repo),
-        Command::Mode { selectors, only } => cmd_mode(selectors, only),
-        Command::Init {
+        Command::Setup { repo, from } => cmd_setup(repo, from, verbose),
+        Command::Mode {
             selectors,
             only,
             dir,
-            force,
-        } => cmd_init(selectors, only, dir, force),
-        Command::IngestFolder { folder, force } => cmd_ingest_folder(folder, force),
-        Command::IngestUrl { url } => cmd_ingest_url(url),
-        Command::ListPlugins => cmd_list_plugins(),
-        Command::ListModes => cmd_list_modes(),
+            no_save,
+        } => cmd_mode(selectors, only, dir, no_save, verbose),
+        Command::Enable { dir } => cmd_enable(dir, verbose),
+        Command::List { plugins } => {
+            if plugins {
+                cmd_list_plugins()
+            } else {
+                cmd_list_modes()
+            }
+        }
         Command::Hook { shell } => cmd_hook(&shell),
+        Command::Completion { shell } => cmd_completion(shell),
         Command::Allow { dir } => cmd_trust(dir, true),
         Command::Deny { dir } => cmd_trust(dir, false),
         Command::Doctor { dir } => cmd_doctor(dir),
-        Command::Auto => cmd_auto(),
+        Command::Auto => Ok(()),
     }
 }
 
@@ -158,18 +173,41 @@ fn resolve_repo(repo: Option<PathBuf>) -> Result<PathBuf> {
     })
 }
 
-fn cmd_setup(repo: Option<PathBuf>) -> Result<()> {
+fn cmd_setup(repo: Option<PathBuf>, from: Option<String>, verbose: bool) -> Result<()> {
+    // If a source is provided, ingest it first with automatic overwrite.
+    if let Some(source) = from {
+        if looks_like_git_url(&source) {
+            let runner = SystemRunner { verbose };
+            let _ = ingest_url(&source, &store::plugins_dir(), &runner)?;
+        } else {
+            let folder = PathBuf::from(source);
+            let folder = folder
+                .canonicalize()
+                .with_context(|| format!("no such folder: {folder:?}"))?;
+            let dest = store::plugins_dir();
+            std::fs::create_dir_all(&dest)
+                .with_context(|| format!("creating store {}", dest.display()))?;
+            // Always overwrite when ingesting as part of setup.
+            let _ = ingest_folder_with(&folder, &dest, &mut |_| true)?;
+        }
+    }
+
+
     // With no explicit --repo, the .aip-cli store is the canonical plugin
     // source. Gate on the *same* predicate setup uses (a discoverable plugin —
     // manifest + Makefile), so a store of manifest-only plugins falls back to
     // repo discovery instead of hard-failing with "no plugins found".
-    let root = match repo {
-        Some(r) => plugins_root(&r),
+    // `vendor` is true only when setup runs against a *source repo*, where a
+    // plugin's `make prepare` can reach its `../../scripts` vendoring tooling.
+    // The store holds already-vendored, self-contained copies, so prepare is
+    // skipped there (running it would fail: `../../scripts` doesn't exist).
+    let (root, vendor) = match repo {
+        Some(r) => (plugins_root(&r), true),
         None => {
             let store = store::plugins_dir();
             match discover_plugins(&store) {
-                Ok(found) if !found.is_empty() => store,
-                _ => plugins_root(&resolve_repo(None)?),
+                Ok(found) if !found.is_empty() => (store, false),
+                _ => (plugins_root(&resolve_repo(None)?), true),
             }
         }
     };
@@ -179,9 +217,19 @@ fn cmd_setup(repo: Option<PathBuf>) -> Result<()> {
         return Err(anyhow!("no plugins found under {root:?}"));
     }
     let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
-    let runner = SystemRunner;
+    let runner = SystemRunner { verbose };
     println!("→ setup ({} plugins)", plugins.len());
-    let steps = run_setup(&plugins, &runner, |p| is_linked(&home, p))?;
+    // Against a source repo we vendor + install normally (`make setup` resolves
+    // its `../../scripts` tooling there). Against the store we do a link-only
+    // refresh: the copies' `make setup`/`link-cowork` targets chain that same
+    // `../../scripts` vendoring, which doesn't exist in the store — so force
+    // `make link` (always exit 0) for every plugin. Adding/vendoring a plugin is
+    // the job of `setup --repo <source>`, not of a bare store refresh.
+    let steps = if vendor {
+        run_setup(&plugins, &runner, |p| is_linked(&home, p), true)?
+    } else {
+        run_setup(&plugins, &runner, |_| true, false)?
+    };
     for s in &steps {
         let icon = match s.status {
             "ok" => "✓",
@@ -190,38 +238,92 @@ fn cmd_setup(repo: Option<PathBuf>) -> Result<()> {
         };
         println!("  {icon} {:<8} {}", s.phase, s.plugin);
     }
+
+    // Also ensure the plugins are installed for grok (registers local path so
+    // `grok plugin enable` works for ingested plugins like flutter/android/apple).
+    if is_on_path("grok") {
+        for p in &plugins {
+            let pstr = p.path.to_string_lossy().into_owned();
+            // `--trust` is required for directory installs: grok refuses an
+            // interactive-confirmation prompt in this non-tty context otherwise.
+            let inv = Invocation::new("grok", &["plugin", "install", &pstr, "--trust"], &p.path);
+            let _ = runner.run(&inv);
+        }
+    }
+
     if steps.iter().any(|s| s.status == "fail") {
         return Err(anyhow!("one or more setup steps failed"));
     }
     Ok(())
 }
 
-fn cmd_mode(selectors: Vec<String>, only: Option<String>) -> Result<()> {
-    let targets = resolve_targets(only)?;
+fn cmd_mode(
+    selectors: Vec<String>,
+    only: Option<String>,
+    dir: PathBuf,
+    no_save: bool,
+    verbose: bool,
+) -> Result<()> {
     let selector = if selectors.is_empty() {
         prompt_for_mode()?
     } else {
         selectors.join(" ")
     };
-    apply_selector(&selector, &targets)
+    let targets = resolve_targets(only.clone())?;
+    apply_selector(&selector, &targets, verbose)?;
+    // Persist the marker by default so `aip-cli enable` can re-apply later.
+    if !no_save {
+        persist_marker(&selector, only, dir)?;
+    }
+    Ok(())
 }
 
-/// True when `program` is reachable: an absolute path that is a file, or a bare
-/// name found on `PATH`.
-fn on_path(program: &str) -> bool {
-    let p = std::path::Path::new(program);
-    if p.is_absolute() {
-        return p.is_file();
+/// Apply the mode from the nearest `.aip-cli.toml` under `dir` (manual only).
+fn cmd_enable(dir: PathBuf, verbose: bool) -> Result<()> {
+    let here = dir
+        .canonicalize()
+        .with_context(|| format!("no such directory: {dir:?}"))?;
+    let marker_path = find_marker(&here).ok_or_else(|| {
+        anyhow!(
+            "no {MARKER_NAME} found above {here:?}\n  pick a mode first: aip-cli mode <name>"
+        )
+    })?;
+    let text = std::fs::read_to_string(&marker_path)
+        .with_context(|| format!("reading {}", marker_path.display()))?;
+    let parsed = Marker::parse(&text)
+        .with_context(|| format!("invalid marker {}", marker_path.display()))?;
+    let targets = match parsed.target.map(Target::from) {
+        Some(t) if is_on_path(t.program()) => vec![t],
+        Some(t) => {
+            return Err(anyhow!(
+                "marker pins agent '{}' but {} is not on PATH",
+                t.key(),
+                t.program()
+            ));
+        }
+        None => detect_targets(),
+    };
+    if targets.is_empty() {
+        return Err(anyhow!(
+            "no AI agents found on PATH (looked for: {})",
+            ALL_TARGETS
+                .iter()
+                .map(|t| t.program())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
-    match std::env::var_os("PATH") {
-        Some(paths) => std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()),
-        None => false,
-    }
+    println!("→ enable from {}", marker_path.display());
+    apply_selector(&parsed.mode, &targets, verbose)?;
+    save_applied_hash(&content_hash(&text))?;
+    Ok(())
 }
+
+
 
 /// Every AI agent currently installed.
 fn detect_targets() -> Vec<Target> {
-    available(&ALL_TARGETS, on_path)
+    available(&ALL_TARGETS, is_on_path)
 }
 
 /// Decide which agents a manual `mode` invocation targets. `only=Some` restricts
@@ -231,7 +333,7 @@ fn resolve_targets(only: Option<String>) -> Result<Vec<Target>> {
         Some(name) => {
             let t = Target::parse(&name)
                 .ok_or_else(|| anyhow!("unknown agent: {name} (use claude or grok)"))?;
-            if !on_path(t.program()) {
+            if !is_on_path(t.program()) {
                 return Err(anyhow!(
                     "agent '{}' is not installed ({} not on PATH)",
                     t.key(),
@@ -255,9 +357,9 @@ fn resolve_targets(only: Option<String>) -> Result<Vec<Target>> {
 }
 
 /// Resolve and apply a selector string against every agent in `targets`.
-fn apply_selector(selector: &str, targets: &[Target]) -> Result<()> {
+fn apply_selector(selector: &str, targets: &[Target], verbose: bool) -> Result<()> {
     let resolution = resolve(selector).map_err(|e| anyhow!("{e}"))?;
-    let runner = SystemRunner;
+    let runner = SystemRunner { verbose };
     let here = cwd()?;
     let agents: Vec<&str> = targets.iter().map(|t| t.key()).collect();
     println!(
@@ -266,33 +368,53 @@ fn apply_selector(selector: &str, targets: &[Target]) -> Result<()> {
         agents.join(", ")
     );
     let reports = apply_targets(&resolution, targets, &here, &runner)?;
+    let mut any_failed = false;
     for r in reports {
+        // An enable the agent rejected (e.g. a renamed/unknown plugin) is *not*
+        // actually on — report only the ones that took, and call out the rest.
         let enabled: Vec<&str> = r
             .actions
             .iter()
-            .filter(|a| a.enable)
-            .map(|a| a.plugin)
+            .filter(|a| a.enable && a.success)
+            .map(|a| a.plugin.as_str())
             .collect();
-        let disabled = r.actions.len() - enabled.len();
+        let failed: Vec<&str> = r
+            .actions
+            .iter()
+            .filter(|a| a.enable && !a.success)
+            .map(|a| a.plugin.as_str())
+            .collect();
+        let disabled = r.actions.iter().filter(|a| !a.enable).count();
         println!(
             "  {} ✓ {} ({} disabled)",
             r.target.key(),
             enabled.join(", "),
             disabled
         );
+        if !failed.is_empty() {
+            any_failed = true;
+            println!(
+                "  {} ✗ failed to enable: {} — {} doesn't know these plugins",
+                r.target.key(),
+                failed.join(", "),
+                r.target.program()
+            );
+        }
+    }
+    if any_failed && !verbose {
+        println!(
+            "  hint: re-run with --verbose to see the underlying error, then check \
+             `{} plugin list` — a renamed plugin must be re-registered with the agent",
+            targets.first().map(|t| t.program()).unwrap_or("claude")
+        );
     }
     Ok(())
 }
 
-fn cmd_init(selectors: Vec<String>, only: Option<String>, dir: PathBuf, force: bool) -> Result<()> {
-    let selector = if selectors.is_empty() {
-        prompt_for_mode()?
-    } else {
-        selectors.join(" ")
-    };
-    // Validate the selector before writing anything.
-    let resolution = resolve(&selector).map_err(|e| anyhow!("{e}"))?;
-
+/// Write a `.aip-cli.toml` marker for `selector` in `dir` so `aip-cli enable`
+/// can re-apply later. Overwrites any existing marker: the user just ran
+/// `mode`, so the folder's recorded mode follows that choice.
+fn persist_marker(selector: &str, only: Option<String>, dir: PathBuf) -> Result<()> {
     // None (the default) => marker has no agent pinned => applies to all agents.
     let target: Option<MarkerTarget> = match only {
         Some(name) => Some(match Target::parse(&name) {
@@ -307,27 +429,17 @@ fn cmd_init(selectors: Vec<String>, only: Option<String>, dir: PathBuf, force: b
         .canonicalize()
         .with_context(|| format!("no such directory: {dir:?}"))?;
     let marker = dir.join(MARKER_NAME);
-    if marker.exists() && !force {
-        return Err(anyhow!(
-            "{} already exists (use --force to overwrite)",
-            marker.display()
-        ));
-    }
-
-    let body = Marker::render(&selector, target);
+    let body = Marker::render(selector, target);
     std::fs::write(&marker, &body).with_context(|| format!("writing {}", marker.display()))?;
-    println!(
-        "✓ wrote {} (mode: {})",
-        marker.display(),
-        resolution.chosen.join(" ")
-    );
 
-    // Trust the marker right after writing it so it auto-activates on cd —
-    // allow always runs as the final step of init.
+    // Keep trust entry for doctor/compat (auto-on-cd is disabled).
     let mut store = TrustStore::load();
     store.allow(&marker.to_string_lossy(), &content_hash(&body));
     store.save()?;
-    println!("✓ trusted — will auto-activate on cd");
+    println!(
+        "✓ saved {} — re-apply later with: aip-cli enable",
+        marker.display()
+    );
     Ok(())
 }
 
@@ -345,64 +457,15 @@ fn prompt_for_mode() -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-/// Ask a yes/no question on stdin, defaulting to no. Returns true only on an
-/// explicit `y`/`yes`. A closed/unreadable stdin counts as no.
-fn prompt_yes_no(question: &str) -> bool {
-    print!("{question} [y/N] ");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-}
-
-fn cmd_ingest_folder(folder: PathBuf, force: bool) -> Result<()> {
-    let folder = folder
-        .canonicalize()
-        .with_context(|| format!("no such folder: {folder:?}"))?;
-    let dest = store::plugins_dir();
-    std::fs::create_dir_all(&dest).with_context(|| format!("creating store {}", dest.display()))?;
-    // On a different-plugin slot collision, `--force`/`-y` overwrites silently;
-    // otherwise prompt and overwrite only on an affirmative answer.
-    let mut on_conflict = |c: &store::StoreConflict| {
-        if force {
-            return true;
-        }
-        prompt_yes_no(&format!(
-            "store slot {} holds plugin '{}'; overwrite with '{}'?",
-            c.slot.display(),
-            c.existing,
-            c.incoming
-        ))
-    };
-    let ingested = ingest_folder_with(&folder, &dest, &mut on_conflict)
-        .with_context(|| format!("ingesting plugins from {}", folder.display()))?;
-    if ingested.is_empty() {
-        return Err(anyhow!(
-            "no plugins found under {} (subdirs need a .claude-plugin/plugin.json)",
-            folder.display()
-        ));
-    }
-    println!(
-        "→ ingested {} plugin(s) into {}",
-        ingested.len(),
-        dest.display()
-    );
-    for i in &ingested {
-        println!("  ✓ {}", i.name);
-    }
-    Ok(())
-}
-
-fn cmd_ingest_url(url: String) -> Result<()> {
-    let dest = store::plugins_dir();
-    std::fs::create_dir_all(&dest).with_context(|| format!("creating store {}", dest.display()))?;
-    let runner = SystemRunner;
-    let i = ingest_url(&url, &dest, &runner).with_context(|| format!("ingesting {url}"))?;
-    println!("→ ingested {} from {}", i.name, url);
-    println!("  ✓ {}", i.dest.display());
-    Ok(())
+/// True for sources that should be cloned as a git repo rather than copied as a
+/// local folder.
+fn looks_like_git_url(s: &str) -> bool {
+    s.starts_with("http://")
+        || s.starts_with("https://")
+        || s.starts_with("git@")
+        || s.starts_with("ssh://")
+        || s.starts_with("git://")
+        || s.ends_with(".git")
 }
 
 fn cmd_list_plugins() -> Result<()> {
@@ -418,7 +481,7 @@ fn cmd_list_plugins() -> Result<()> {
     dirs.sort();
     if dirs.is_empty() {
         println!("(no plugins in {})", root.display());
-        println!("  ingest some with: aip-cli ingest-folder <dir>  or  aip-cli ingest-url <url>");
+        println!("  ingest some with: aip-cli ingest <folder-or-git-url>");
         return Ok(());
     }
     println!("plugins in {}:", root.display());
@@ -464,7 +527,7 @@ fn cmd_doctor(dir: PathBuf) -> Result<()> {
                 let home = home.as_path();
                 s.spawn(move || AgentInput {
                     target,
-                    on_path: on_path(target.program()),
+                    on_path: is_on_path(target.program()),
                     state: read_state(target, home),
                 })
             })
@@ -506,6 +569,32 @@ fn cmd_hook(shell: &str) -> Result<()> {
     Ok(())
 }
 
+fn cmd_completion(shell: CompleteShell) -> Result<()> {
+    let mut cmd = Cli::command();
+    // Wire current known modes as suggestions for `aip-cli mode <TAB>`.
+    // This bakes the list into the generated script (re-run completion after ingest to refresh).
+    if let Some(mode_cmd) = cmd.find_subcommand_mut("mode") {
+        let mode_keys: Vec<&'static str> = modes::registry().iter().map(|m| m.key).collect();
+        let updated = mode_cmd.clone()
+            .mut_arg("selectors", |arg| {
+                arg.value_parser(PossibleValuesParser::new(mode_keys))
+            })
+            .mut_arg("only", |arg| {
+                arg.value_parser(PossibleValuesParser::new(["claude", "grok"]))
+            });
+        *mode_cmd = updated;
+    }
+    if let Some(hook_cmd) = cmd.find_subcommand_mut("hook") {
+        let updated = hook_cmd.clone().mut_arg("shell", |arg| {
+            arg.value_parser(PossibleValuesParser::new(["bash", "zsh"]))
+        });
+        *hook_cmd = updated;
+    }
+    let bin = cmd.get_name().to_string();
+    generate(shell, &mut cmd, bin, &mut std::io::stdout());
+    Ok(())
+}
+
 fn cmd_trust(dir: PathBuf, allow: bool) -> Result<()> {
     let dir = dir.canonicalize().with_context(|| format!("{dir:?}"))?;
     let marker = dir.join(MARKER_NAME);
@@ -526,50 +615,4 @@ fn cmd_trust(dir: PathBuf, allow: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_auto() -> Result<()> {
-    let here = cwd()?;
-    let marker =
-        find_marker(&here).and_then(|p| std::fs::read_to_string(&p).ok().map(|text| (p, text)));
-    let trusted = match &marker {
-        Some((p, text)) => TrustStore::load().is_allowed(&p.to_string_lossy(), &content_hash(text)),
-        None => false,
-    };
-    let applied = load_applied_hash();
-    match hook::decide(marker, trusted, applied.as_deref()) {
-        AutoAction::Activate {
-            marker,
-            mode,
-            target,
-        } => {
-            let text = std::fs::read_to_string(&marker)?;
-            // No pinned target => every installed agent; pinned => that one if installed.
-            let targets = match target {
-                Some(t) if on_path(t.program()) => vec![t],
-                Some(t) => {
-                    eprintln!(
-                        "aip-cli: agent '{}' pinned but not installed; skipping",
-                        t.key()
-                    );
-                    vec![]
-                }
-                None => detect_targets(),
-            };
-            if targets.is_empty() {
-                eprintln!("aip-cli: no installed agents to apply mode '{mode}'");
-            } else {
-                apply_selector(&mode, &targets)?;
-                // Only record success so it retries once an agent is installed.
-                save_applied_hash(&content_hash(&text))?;
-            }
-        }
-        AutoAction::Untrusted { marker } => {
-            let dir = marker.parent().unwrap_or(&marker).display();
-            eprintln!("aip-cli: {MARKER_NAME} found but not trusted. Run: aip-cli allow {dir}");
-        }
-        AutoAction::Invalid { marker, error } => {
-            eprintln!("aip-cli: invalid {}: {error}", marker.display());
-        }
-        AutoAction::AlreadyActive | AutoAction::None => {}
-    }
-    Ok(())
-}
+

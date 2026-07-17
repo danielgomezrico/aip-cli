@@ -1,5 +1,6 @@
-//! Shell-hook generation, the `.aip-cli.toml` marker, a direnv-style trust
-//! store, and the pure decision logic that drives auto-activation on `cd`.
+//! Shell-hook generation (no-op; auto-on-cd is disabled), the `.aip-cli.toml`
+//! marker, a direnv-style trust store, and pure decision helpers kept for
+//! doctor/compat.
 
 use crate::config::{config_dir, MARKER_NAME};
 use crate::mode_apply::Target;
@@ -197,9 +198,10 @@ impl TrustStore {
     }
 }
 
-// ─── auto-activation decision (pure) ─────────────────────────────────────────
+// ─── marker decision helpers (pure; used by doctor / tests) ──────────────────
 
-/// What the `auto` command should do for the current directory.
+/// What a legacy auto-apply path would do for the current directory.
+/// Kept for unit tests and doctor-style analysis; shell auto-on-cd is disabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoAction {
     /// Apply `mode`; `marker` is the absolute marker path. `target` is `Some`
@@ -219,7 +221,7 @@ pub enum AutoAction {
     None,
 }
 
-/// Decide what to do, purely from inputs (no filesystem access).
+/// Decide what an auto-apply would do, purely from inputs (no filesystem).
 ///
 /// * `marker` — `(path, raw_contents)` when a marker was found.
 /// * `trusted` — whether the trust store allows this marker at its current hash.
@@ -281,33 +283,16 @@ pub fn save_applied_hash(hash: &str) -> std::io::Result<()> {
 
 // ─── shell hook ──────────────────────────────────────────────────────────────
 
-/// Emit the shell snippet a user adds to their rc file. `exe` is the absolute
-/// path to the `aip-cli` binary so the hook keeps working regardless of PATH.
+/// Emit a no-op shell snippet. Auto-on-cd is disabled; modes apply only via
+/// `aip-cli mode` / `aip-cli enable`. `shell` and `exe` are accepted so the
+/// `hook` CLI stays stable for anyone still eval'ing an old rc line.
 pub fn hook_script(shell: Shell, exe: &str) -> String {
-    match shell {
-        Shell::Bash => format!(
-            r#"# aip-cli shell hook (bash)
-_aip_cli_hook() {{
-  "{exe}" auto 2>/dev/null
-}}
-if [[ ";${{PROMPT_COMMAND:-}};" != *";_aip_cli_hook;"* ]]; then
-  PROMPT_COMMAND="_aip_cli_hook${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}"
-fi
+    let _ = (shell, exe);
+    String::from(
+        r#"# aip-cli: auto-on-cd is disabled.
+# Apply a folder mode manually with: aip-cli enable
 "#,
-            exe = exe
-        ),
-        Shell::Zsh => format!(
-            r#"# aip-cli shell hook (zsh)
-_aip_cli_hook() {{
-  "{exe}" auto 2>/dev/null
-}}
-autoload -Uz add-zsh-hook
-add-zsh-hook chpwd _aip_cli_hook
-_aip_cli_hook
-"#,
-            exe = exe
-        ),
-    }
+    )
 }
 
 #[cfg(test)]
@@ -489,15 +474,14 @@ mod tests {
     }
 
     #[test]
-    fn hook_script_bash_mentions_prompt_command() {
-        let s = hook_script(Shell::Bash, "/usr/local/bin/aip-cli");
-        assert!(s.contains("PROMPT_COMMAND"));
-        assert!(s.contains("/usr/local/bin/aip-cli\" auto"));
-    }
-
-    #[test]
-    fn hook_script_zsh_uses_chpwd() {
-        let s = hook_script(Shell::Zsh, "/x/aip-cli");
-        assert!(s.contains("add-zsh-hook chpwd"));
+    fn hook_script_is_noop_for_both_shells() {
+        for shell in [Shell::Bash, Shell::Zsh] {
+            let s = hook_script(shell, "/usr/local/bin/aip-cli");
+            assert!(s.contains("auto-on-cd is disabled"), "{s}");
+            assert!(!s.contains("PROMPT_COMMAND"), "{s}");
+            assert!(!s.contains("chpwd"), "{s}");
+            assert!(!s.contains("\" auto"), "{s}");
+            assert!(!s.contains("aip-cli auto"), "{s}");
+        }
     }
 }

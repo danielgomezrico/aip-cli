@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// Name of the per-directory marker that enables auto-activation on `cd`.
+/// Name of the per-directory marker that records the mode for `aip-cli enable`.
 pub const MARKER_NAME: &str = ".aip-cli.toml";
 
 /// The per-user config dir (platform-specific): `~/.config/aip-cli` on

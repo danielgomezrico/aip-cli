@@ -19,9 +19,12 @@ help:
 	@echo "  release-dry   Preview the next version bump (cargo-release)"
 	@echo "  release       Cut a release (bump + tag + changelog)  [LEVEL=patch|minor|major]"
 	@echo ""
-	@echo "After 'make install', enable auto-activation by adding to your rc file:"
-	@echo "  bash:  eval \"\$$($(BIN) hook bash)\""
-	@echo "  zsh:   eval \"\$$($(BIN) hook zsh)\""
+	@echo "After 'make install':"
+	@echo "  $(BIN) mode <name>   # pick + apply a mode (saves .aip-cli.toml)"
+	@echo "  $(BIN) enable        # re-apply this folder's saved mode (manual; no auto-on-cd)"
+	@echo "Tab completion:"
+	@echo "  bash:  source <(\$$($(BIN) completion bash))   (or write to ~/.local/share/bash-completion/completions/$(BIN))"
+	@echo "  zsh:   mkdir -p ~/.zfunc && $(BIN) completion zsh > ~/.zfunc/_$(BIN)  (then fpath + compinit)"
 
 deps:
 	@command -v rustup >/dev/null 2>&1 || { echo "✗ rustup not found — install from https://rustup.rs"; exit 1; }
@@ -45,7 +48,8 @@ lint:
 install: deps test
 	$(CARGO) install --path crates/cli --root $(PREFIX) --locked --force
 	@echo "✓ installed $(BIN) → $(PREFIX)/bin/$(BIN)"
-	@echo "  add to your shell rc:  eval \"\$$($(BIN) hook bash)\"   (or zsh)"
+	@echo "  usage:    $(BIN) mode <name>   then later  $(BIN) enable"
+	@echo "  complete: source <(\$$($(BIN) completion bash))   (bash)  or  $(BIN) completion zsh > ~/.zfunc/_$(BIN) (zsh)"
 
 uninstall:
 	$(CARGO) uninstall $(BIN) --root $(PREFIX) || true

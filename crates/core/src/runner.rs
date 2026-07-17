@@ -68,21 +68,89 @@ impl<R: CommandRunner + ?Sized> CommandRunner for std::sync::Arc<R> {
 /// stdout/stderr so each `plugin enable/disable` call doesn't spam the terminal
 /// with its own per-plugin chatter — the caller renders one grouped summary
 /// instead.
+///
+/// stdin is also detached (`/dev/null`): these are non-interactive, programmatic
+/// invocations (`make`, `claude/grok plugin enable …`). Inheriting the terminal
+/// would let a child see an interactive tty (`isatty` → true) and switch it to
+/// raw/no-echo mode. Detaching stdin avoids a child that exits without restoring
+/// termios leaving the user's shell with echo off (typed keys invisible until
+/// Enter). A null stdin makes every child read EOF and never touch the
+/// controlling terminal.
+///
+/// When `verbose` is set, the child's stdout/stderr is *captured* (still not
+/// inherited, preserving the termios safety above) and echoed to our own stderr
+/// in one block per command, along with the rendered command line and exit code.
+/// This is how the user sees that e.g. `claude plugin enable flutter` actually
+/// failed ("no such plugin") even though the per-plugin chatter is normally
+/// hidden behind the grouped summary.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct SystemRunner;
+pub struct SystemRunner {
+    pub verbose: bool,
+}
+
+impl SystemRunner {
+    /// A runner that silences child output (the default, production behaviour).
+    pub fn new() -> Self {
+        Self { verbose: false }
+    }
+
+    /// A runner that captures and echoes each command's output and exit code to
+    /// stderr — used by `--verbose` to expose silently-tolerated failures.
+    pub fn verbose() -> Self {
+        Self { verbose: true }
+    }
+}
+
+/// Decide whether a `plugin enable/disable` call left the plugin in the desired
+/// state. The host CLIs exit non-zero for the common *no-op* case ("Plugin X is
+/// already enabled" / "already disabled") — that's success, not failure. Any
+/// other non-zero exit (e.g. "not found in any editable settings scope" after a
+/// rename, or a broken config) is a genuine failure. A zero exit is always
+/// success. This is why we must read stderr rather than trust the exit code
+/// alone — and why the original code ignored exit codes entirely.
+pub fn outcome_is_success(raw_success: bool, stderr: &str) -> bool {
+    if raw_success {
+        return true;
+    }
+    let s = stderr.to_ascii_lowercase();
+    s.contains("already enabled") || s.contains("already disabled")
+}
 
 impl CommandRunner for SystemRunner {
     fn run(&self, inv: &Invocation) -> std::io::Result<Outcome> {
-        let status = Command::new(&inv.program)
+        // Always capture (never inherit) the child's stdout/stderr: we need
+        // stderr to classify "already enabled" no-ops as success, and capturing
+        // keeps the termios safety described above (stdin stays null, the child
+        // never touches the controlling tty). Output is echoed only in verbose.
+        let output = Command::new(&inv.program)
             .args(&inv.args)
             .current_dir(&inv.cwd)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        Ok(Outcome {
-            success: status.success(),
-            code: status.code(),
-        })
+            .stdin(Stdio::null())
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let success = outcome_is_success(output.status.success(), &stderr);
+        let code = output.status.code();
+
+        if self.verbose {
+            // Build one block and write it in a single call so parallel runs
+            // don't interleave line-by-line.
+            let mut block = String::new();
+            let marker = if success { "✓" } else { "✗" };
+            block.push_str(&format!(
+                "  [{marker}] {} (exit {})\n",
+                inv.display(),
+                code.map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into())
+            ));
+            for (label, bytes) in [("out", &output.stdout), ("err", &output.stderr)] {
+                let text = String::from_utf8_lossy(bytes);
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    block.push_str(&format!("      {label}| {line}\n"));
+                }
+            }
+            eprint!("{block}");
+        }
+        Ok(Outcome { success, code })
     }
 }
 
@@ -165,6 +233,35 @@ pub fn make(target: &str, dir: &Path) -> Invocation {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn outcome_zero_exit_is_success_regardless_of_stderr() {
+        assert!(outcome_is_success(true, ""));
+        assert!(outcome_is_success(true, "some warning noise"));
+    }
+
+    #[test]
+    fn outcome_already_in_state_is_success() {
+        assert!(outcome_is_success(
+            false,
+            r#"Plugin "x" is already enabled"#
+        ));
+        assert!(outcome_is_success(false, "Plugin already disabled"));
+        // Case-insensitive.
+        assert!(outcome_is_success(false, "ALREADY ENABLED"));
+    }
+
+    #[test]
+    fn outcome_unknown_plugin_is_failure() {
+        // The renamed-plugin case the user hit.
+        assert!(!outcome_is_success(
+            false,
+            r#"Plugin "flutter" not found in any editable settings scope. Use plugin@marketplace format."#
+        ));
+        // Broken config is also a real failure.
+        assert!(!outcome_is_success(false, "TOML parse error at line 18"));
+        assert!(!outcome_is_success(false, ""));
+    }
 
     #[test]
     fn invocation_display_joins_args() {

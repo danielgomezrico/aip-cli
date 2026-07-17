@@ -2,6 +2,7 @@
 
 use crate::modes::Resolution;
 use crate::runner::{CommandRunner, Invocation};
+use crate::store;
 use rayon::prelude::*;
 use std::path::Path;
 
@@ -62,17 +63,42 @@ pub fn available<F: Fn(&str) -> bool>(targets: &[Target], exists: F) -> Vec<Targ
         .collect()
 }
 
-/// One enable/disable decision for a plugin.
+/// Return true if `program` can be found as an executable on PATH (or is an
+/// absolute file). Used to decide whether to drive a particular agent.
+pub fn is_on_path(program: &str) -> bool {
+    let p = std::path::Path::new(program);
+    if p.is_absolute() {
+        return p.is_file();
+    }
+    match std::env::var_os("PATH") {
+        Some(paths) => std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()),
+        None => false,
+    }
+}
+
+/// One enable/disable decision for a plugin, and whether the host CLI accepted
+/// it. `success == false` means the `plugin enable/disable` call exited non-zero
+/// (e.g. the agent doesn't know that plugin name) — the run continues, but the
+/// caller can surface it instead of pretending the plugin is now enabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Action {
-    pub plugin: &'static str,
+    pub plugin: String,
     pub enable: bool,
+    pub success: bool,
 }
 
 /// Apply `resolution` against `target`, running `<prog> plugin enable|disable`
-/// for every plugin in parallel. Failures of individual enable/disable
-/// calls are tolerated (matching the original `|| true`); the returned vec lists
-/// the actions taken in canonical order.
+/// for every plugin **sequentially** in canonical order. The calls must NOT run
+/// in parallel: each `claude/grok plugin enable|disable` does a read-modify-write
+/// of the same host config file (`~/.grok/config.toml`, claude's settings), and
+/// concurrent invocations clobber each other — a torn write leaves trailing bytes
+/// from a longer previous version, corrupting the TOML/JSON so every later command
+/// fails to parse (observed: grok config truncated mid-array). Different *targets*
+/// touch different files, so cross-target parallelism (in [`apply_targets`]) stays
+/// safe; only within a target must the writes serialize.
+///
+/// Failures of individual enable/disable calls are tolerated (matching the
+/// original `|| true`); the returned vec lists the actions in canonical order.
 pub fn apply_mode<R: CommandRunner + Send + Sync + ?Sized>(
     resolution: &Resolution,
     target: Target,
@@ -80,23 +106,37 @@ pub fn apply_mode<R: CommandRunner + Send + Sync + ?Sized>(
     runner: &R,
 ) -> std::io::Result<Vec<Action>> {
     let (on, _off) = resolution.partition();
-    let cwd_owned = cwd.to_path_buf();
 
-    let actions: std::io::Result<Vec<_>> = crate::modes::all_plugins()
-        .par_iter()
-        .map(|&plugin| {
+    // Pre-install desired plugins for Grok using the aip store copy. This makes
+    // the plugin known to grok (e.g. after ingesting claude-only plugins like
+    // flutter/android/apple) so the later enable call succeeds.
+    if target == Target::Grok {
+        let store = store::plugins_dir();
+        for plugin in &on {
+            let pdir = store.join(plugin);
+            if pdir.is_dir() {
+                let pstr = pdir.to_string_lossy().into_owned();
+                // Use the caller's cwd (e.g. repo root) for the install invocation,
+                // same as the subsequent enable/disable calls.
+                let _ = runner.run(&Invocation::new("grok", &["plugin", "install", &pstr], cwd));
+            }
+        }
+    }
+
+    crate::modes::all_plugins()
+        .into_iter()
+        .map(|plugin| {
             let enable = on.contains(&plugin);
             let verb = if enable { "enable" } else { "disable" };
-            let inv = Invocation::new(target.program(), &["plugin", verb, plugin], &cwd_owned);
-            let _ = runner.run(&inv)?;
-            Ok(Action { plugin, enable })
+            let inv = Invocation::new(target.program(), &["plugin", verb, plugin.as_str()], cwd);
+            let outcome = runner.run(&inv)?;
+            Ok(Action {
+                plugin,
+                enable,
+                success: outcome.success,
+            })
         })
-        .collect();
-
-    let mut result = actions?;
-    // Restore canonical order.
-    result.sort_by_key(|a| crate::modes::all_plugins().iter().position(|&p| p == a.plugin).unwrap_or(0));
-    Ok(result)
+        .collect()
 }
 
 /// The result of applying a mode to one agent.
@@ -156,8 +196,12 @@ mod tests {
 
         // Check runner was called for each plugin (order may vary due to parallel execution).
         let lines = runner.lines();
-        assert!(lines.iter().any(|l| l == "claude plugin enable ai-architecture"));
-        assert!(lines.iter().any(|l| l == "claude plugin enable software-engineer"));
+        assert!(lines
+            .iter()
+            .any(|l| l == "claude plugin enable ai-architecture"));
+        assert!(lines
+            .iter()
+            .any(|l| l == "claude plugin enable software-engineer"));
         assert!(lines.iter().any(|l| l == "claude plugin disable flutter"));
     }
 
@@ -170,6 +214,17 @@ mod tests {
         assert!(runner
             .lines()
             .contains(&"grok plugin enable job-hunter".to_string()));
+
+        // Install calls (if any) must be for grok and only for plugins in the enabled set.
+        // (Presence depends on whether the test machine's aip store has those plugin dirs.)
+        let all_lines = runner.lines();
+        let install_calls: Vec<_> = all_lines
+            .iter()
+            .filter(|l| l.contains("grok plugin install"))
+            .collect();
+        for call in &install_calls {
+            assert!(call.contains("ai-architecture") || call.contains("job-hunter"));
+        }
     }
 
     #[test]
@@ -199,9 +254,20 @@ mod tests {
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].target, Target::ClaudeCode);
         assert_eq!(reports[1].target, Target::Grok);
-        // Each agent got one call per plugin.
+
+        // Compute expected pre-installs based on *actual* store state at test time
+        // (makes test robust across machines with/without populated ~/.aip-cli/plugins).
+        let store = store::plugins_dir();
+        let grok_preinstalls = res
+            .enabled
+            .iter()
+            .filter(|name| store.join(name).is_dir())
+            .count();
+
+        // Claude: n calls. Grok: n calls + preinstalls for this target.
         let n = crate::modes::all_plugins().len();
-        assert_eq!(runner.lines().len(), 2 * n);
+        assert_eq!(runner.lines().len(), 2 * n + grok_preinstalls);
+
         assert!(runner
             .lines()
             .contains(&"claude plugin enable ai-architecture".to_string()));
@@ -220,11 +286,109 @@ mod tests {
     }
 
     #[test]
+    fn is_on_path_detects_absolute_and_bare_names() {
+        // Iteration 3
+        assert!(is_on_path("/bin/sh")); // absolute existing
+        assert!(is_on_path("sh"));      // bare, should be on PATH on unix/mac
+        assert!(!is_on_path("/this/does/not/exist/really123"));
+        assert!(!is_on_path("definitely-not-a-real-binary-xyz"));
+    }
+
+    #[test]
+    fn preinstall_skips_when_target_not_grok() {
+        let res = resolve("minimal").unwrap();
+        let runner = RecordingRunner::new();
+        // Even if store has dirs, claude target must never emit grok install
+        let _ = apply_mode(&res, Target::ClaudeCode, &PathBuf::from("/r"), &runner);
+        assert!(!runner.lines().iter().any(|l| l.contains("grok")));
+    }
+
+    #[test]
     fn tolerates_individual_failures() {
         let res = resolve("minimal").unwrap();
         let runner = RecordingRunner::failing(|inv| inv.args.contains(&"disable".to_string()));
         // Should not error even though every disable "fails".
         let actions = apply_mode(&res, Target::ClaudeCode, &PathBuf::from("/r"), &runner).unwrap();
         assert_eq!(actions.iter().filter(|a| a.enable).count(), 2);
+    }
+
+    #[test]
+    fn grok_preinstall_only_for_plugins_present_in_store() {
+        // TDD iteration 1: control the aip store via HOME to simulate partial ingest.
+        // "minimal" enables ai-architecture + software-engineer.
+        // Create dir only for one of them under a temp store.
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_home = TempDir::new().unwrap();
+        let store_plugins = temp_home.path().join(".aip-cli").join("plugins");
+        fs::create_dir_all(&store_plugins).unwrap();
+
+        // Only "ai-architecture" present in this fake store (simulates partial ingest).
+        let present = store_plugins.join("ai-architecture");
+        fs::create_dir_all(&present).unwrap();
+
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", temp_home.path());
+
+        let res = resolve("minimal").unwrap();
+        let runner = RecordingRunner::new();
+        let _ = apply_mode(&res, Target::Grok, &PathBuf::from("/repo"), &runner);
+
+        // Restore
+        if let Some(h) = old_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        let lines = runner.lines();
+
+        // Exactly one pre-install (only for the dir that existed)
+        let install_lines: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("grok plugin install"))
+            .collect();
+        assert_eq!(install_lines.len(), 1);
+        assert!(install_lines[0].contains("ai-architecture"));
+        assert!(!install_lines.iter().any(|l| l.contains("software-engineer")));
+
+        // Still performs enable/disable for *all* catalog plugins (pre-install is additive)
+        let n = crate::modes::all_plugins().len();
+        assert_eq!(lines.len(), n + 1); // +1 for the one install
+
+        // The enable for the present one (and the other) must still be issued
+        assert!(lines.iter().any(|l| l.contains("grok plugin enable ai-architecture")));
+        assert!(lines.iter().any(|l| l.contains("grok plugin enable software-engineer")));
+
+        // Verify that the install invocation used the caller's cwd (not the plugin dir).
+        let calls = runner.calls();
+        if let Some(install) = calls.iter().find(|c| c.args.iter().any(|a| a == "install")) {
+            assert_eq!(install.cwd, PathBuf::from("/repo"));
+        }
+    }
+
+    #[test]
+    fn grok_preinstall_failure_is_ignored_and_enables_are_still_attempted() {
+        // Iteration 2: simulate `grok plugin install` failing (bad manifest, permission,
+        // grok not liking the dir, etc.). The apply must continue and still issue
+        // the enable/disable actions.
+        let res = resolve("minimal").unwrap();
+        let runner = RecordingRunner::failing(|inv| {
+            inv.args.iter().any(|a| a == "install")
+        });
+        let actions = apply_mode(&res, Target::Grok, &PathBuf::from("/r"), &runner).unwrap();
+
+        let n = crate::modes::all_plugins().len();
+        assert_eq!(actions.len(), n);
+
+        // Wanted enables were still attempted (the install failure was swallowed)
+        assert_eq!(actions.iter().filter(|a| a.enable).count(), 2);
+
+        // We did attempt the installs (they "failed" per the mock)
+        assert!(runner
+            .lines()
+            .iter()
+            .any(|l| l.contains("grok plugin install")));
     }
 }

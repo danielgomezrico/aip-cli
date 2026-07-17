@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Core domain logic for the aip-cli CLI: plugin discovery, mode resolution, setup orchestration, and shell-hook trust."
+description = "Core domain logic for the aip-cli CLI: plugin discovery, mode resolution, setup orchestration, and marker trust."
 
 [dependencies]
 anyhow.workspace = true

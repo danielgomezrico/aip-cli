@@ -39,7 +39,7 @@ pub fn store_name(src: &Path) -> Option<String> {
 ///
 /// Symlinks are recreated as symlinks rather than followed: this preserves a
 /// plugin's on-disk layout and, crucially, avoids unbounded recursion (a stack
-/// overflow) on a symlink that points back into an ancestor — `ingest-folder`
+/// overflow) on a symlink that points back into an ancestor — folder ingest
 /// runs over arbitrary user-supplied directories.
 pub fn copy_dir_all(src: &Path, dest: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dest)?;

@@ -2,7 +2,7 @@
 
 Enable the right AI plugins, skills, and agents per folder — disable the rest. No uninstalls, no permanent bloat.
 
-Inspired by [direnv](https://direnv.net): drop a marker file in a project, and the moment you `cd` in, the right set turns on and everything else turns off.
+Drop a marker file in a project, then run `aip-cli enable` when you want that folder's set on. Nothing auto-switches on `cd`.
 
 ## Why
 
@@ -10,7 +10,7 @@ AI agents load every enabled skill and agent into context. The more you have on,
 
 The usual fix is to uninstall and reinstall as you switch projects. That's slow and easy to forget.
 
-aip-cli keeps everything installed but only activates what the current folder needs.
+aip-cli keeps everything installed but only activates what you explicitly enable for the current folder.
 
 ## Use cases
 
@@ -20,9 +20,9 @@ aip-cli keeps everything installed but only activates what the current folder ne
 
 ## How it works
 
-- Put a `.aip-cli.toml` in a project folder (like `.envrc`).
-- On `cd`, it runs `claude plugin enable/disable` (and the same for grok) to turn the right set on and everything else off.
-- Change folders → it flips the set. Nothing is ever uninstalled.
+- Put a `.aip-cli.toml` in a project folder (or let `aip-cli mode` write one).
+- Run `aip-cli enable` to apply that mode: `claude`/`grok plugin enable|disable` for the right set.
+- Nothing runs on `cd`. Modes only change when you run `mode` or `enable`.
 
 ## Install
 
@@ -35,14 +35,25 @@ git clone https://github.com/dan/aip-cli.git && cd aip-cli && make install
 ## Quick start
 
 ```bash
-# once: wire up the shell hook
-eval "$(aip-cli hook zsh)"   # or bash
+# once: tab completion
+# bash (easiest):
+source <(aip-cli completion bash)
+# bash (persistent):
+#   aip-cli completion bash > ~/.local/share/bash-completion/completions/aip-cli
+# zsh (persistent):
+#   mkdir -p ~/.zfunc && aip-cli completion zsh > ~/.zfunc/_aip-cli
+#   # then in ~/.zshrc: fpath=(~/.zfunc $fpath); autoload -Uz compinit; compinit
 
-# in a project: write + trust the marker
-aip-cli init mobile
+# in a project: pick a mode — applies now and writes .aip-cli.toml
+aip-cli mode mobile
 
-# now cd in and out — the right plugins, skills, and agents follow
+# later (same or another shell): re-apply this folder's saved mode
+aip-cli enable
 ```
+
+`aip-cli mode` applies the set to every installed agent *and* writes a
+`.aip-cli.toml` marker so you can re-apply with `aip-cli enable`. Pass `--no-save`
+for a one-off apply that leaves no marker.
 
 ## Marker file
 
@@ -51,9 +62,7 @@ mode = "mobile"
 # target = "grok"   # optional, defaults to all installed agents
 ```
 
-Trust folders with `aip-cli allow` / `aip-cli deny`, just like direnv — or let `aip-cli init` do it for you.
-
-See `aip-cli --help` for `mode`, `list-modes`, and more.
+See `aip-cli --help` for `mode`, `enable`, `setup`, `list`, and more.
 
 ## Doctor
 

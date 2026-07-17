@@ -6,6 +6,7 @@
 //! trait, which has both a real and a recording implementation.
 
 pub mod agent_state;
+pub mod categories;
 pub mod config;
 pub mod discovery;
 pub mod doctor;
@@ -24,5 +25,8 @@ pub use doctor::{build_report, render as render_doctor, DoctorReport};
 pub use ingest::{ingest_folder, ingest_url, Ingested};
 pub use manifest::PluginManifest;
 pub use mode_apply::{apply_mode, Target};
-pub use modes::{resolve, Mode, ModeError, all_plugins, get_plugin_metadata, Role, Domain, PluginMetadata};
+pub use modes::{
+    all_plugins, builtin_metadata, catalog, get_plugin_metadata, resolve, set_overlay, Domain,
+    Mode, ModeError, PluginMetadata, Role,
+};
 pub use runner::{CommandRunner, RecordingRunner, SystemRunner};

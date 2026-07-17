@@ -1,8 +1,14 @@
-//! Setup orchestration: run each plugin's `prepare` then `install` target.
+//! Setup orchestration: optionally run each plugin's `prepare`, then `install`.
 //!
 //! Mirrors `run_all.py`:
 //! - **prepare** — run `make prepare` for every plugin whose Makefile has a
-//!   `prepare:` target; skip the rest.
+//!   `prepare:` target; skip the rest. This is a *vendoring* build step: a
+//!   plugin's `prepare` typically shells out to `../../scripts/vendor_shared.py`
+//!   to bake shared reference files into the plugin. That path only resolves in
+//!   the **source repo** (`<repo>/plugins/<name>/../../scripts`), so prepare runs
+//!   only when setup operates against a source checkout — never against the
+//!   `~/.aip-cli` store, whose copies are already self-contained. The `vendor`
+//!   flag on [`run_setup`] carries that distinction.
 //! - **install** — run `make link` when the plugin is already dev-linked into the
 //!   Claude cache, otherwise `make setup`.
 
@@ -96,13 +102,36 @@ where
     Ok(steps)
 }
 
-/// Full setup: prepare then install. Returns all steps in order.
-pub fn run_setup<R, F>(plugins: &[Plugin], runner: &R, linked: F) -> std::io::Result<Vec<Step>>
+/// Full setup: optionally prepare (vendor), then install. Returns all steps in
+/// order.
+///
+/// `vendor` gates the prepare phase: pass `true` when `plugins` live in a source
+/// repo (their `../../scripts` vendoring tooling resolves), `false` when they are
+/// store copies that are already self-contained. When `false`, every plugin's
+/// prepare step is recorded as skipped and no `make prepare` runs.
+pub fn run_setup<R, F>(
+    plugins: &[Plugin],
+    runner: &R,
+    linked: F,
+    vendor: bool,
+) -> std::io::Result<Vec<Step>>
 where
     R: CommandRunner,
     F: Fn(&Plugin) -> bool,
 {
-    let mut steps = run_prepare(plugins, runner)?;
+    let mut steps = if vendor {
+        run_prepare(plugins, runner)?
+    } else {
+        plugins
+            .iter()
+            .map(|p| Step {
+                plugin: p.name.clone(),
+                phase: "prepare",
+                status: "skip",
+                command: None,
+            })
+            .collect()
+    };
     steps.extend(run_install(plugins, runner, linked)?);
     Ok(steps)
 }
@@ -163,11 +192,28 @@ mod tests {
     fn full_setup_runs_prepare_then_install() {
         let plugins = vec![plugin("a", true)];
         let runner = RecordingRunner::new();
-        let steps = run_setup(&plugins, &runner, |_| false).unwrap();
+        let steps = run_setup(&plugins, &runner, |_| false, true).unwrap();
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].phase, "prepare");
         assert_eq!(steps[1].phase, "install");
         assert_eq!(runner.lines(), vec!["make prepare", "make setup"]);
+    }
+
+    #[test]
+    fn setup_without_vendor_skips_prepare_entirely() {
+        // Store copies are self-contained: prepare must never run, even for a
+        // plugin whose Makefile has a prepare target (its ../../scripts vendoring
+        // path would not resolve from the store).
+        let plugins = vec![plugin("a", true)];
+        let runner = RecordingRunner::new();
+        let steps = run_setup(&plugins, &runner, |_| false, false).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].phase, "prepare");
+        assert_eq!(steps[0].status, "skip");
+        assert_eq!(steps[0].command, None);
+        assert_eq!(steps[1].phase, "install");
+        // Only the install target ran; no `make prepare`.
+        assert_eq!(runner.lines(), vec!["make setup"]);
     }
 
     #[test]

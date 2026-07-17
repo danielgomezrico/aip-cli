@@ -271,7 +271,7 @@ fn render_project(r: &DoctorReport, out: &mut String) {
     match &p.marker {
         None => {
             out.push_str(&format!(
-                "  {OFF} no .aip-cli.toml marker in scope (run `aip-cli init <mode>`)\n"
+                "  {OFF} no .aip-cli.toml marker in scope (run `aip-cli mode <mode>`)\n"
             ));
             return;
         }
@@ -302,10 +302,7 @@ fn render_project(r: &DoctorReport, out: &mut String) {
     let (icon, trust) = if p.trusted {
         (OK, "trusted")
     } else {
-        (
-            WARN,
-            "untrusted — run `aip-cli allow` to enable auto-activation",
-        )
+        (WARN, "untrusted — run `aip-cli allow` if you use trust checks")
     };
     out.push_str(&format!("  {icon} trust: {trust}\n"));
 
@@ -315,7 +312,7 @@ fn render_project(r: &DoctorReport, out: &mut String) {
         } else {
             (
                 WARN,
-                "pending (mode not yet applied — `cd` here or run `aip-cli mode`)",
+                "pending (mode not yet applied — run `aip-cli enable`)",
             )
         };
         out.push_str(&format!("  {icon} state: {state}\n"));
@@ -341,7 +338,7 @@ fn render_store(r: &DoctorReport, out: &mut String) {
     ));
     if r.store.is_empty() {
         out.push_str(&format!(
-            "  {OFF} empty (ingest with `aip-cli ingest-folder <dir>` or `ingest-url <url>`)\n"
+            "  {OFF} empty (ingest with `aip-cli ingest <folder-or-git-url>`)\n"
         ));
         return;
     }
