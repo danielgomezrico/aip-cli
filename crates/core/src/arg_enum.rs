@@ -62,4 +62,66 @@ mod tests {
         assert_eq!(Domain::parse("frontend"), Some(Domain::Web));
         assert_eq!(Role::parse("pm"), Some(Role::ProductManager));
     }
+
+    // -- Round-1 edge-case hunt: shared normalization contract -------------
+
+    #[test]
+    fn parse_trims_tabs_and_newlines_not_just_spaces() {
+        // `.trim()` strips all ASCII (and Unicode) whitespace, not just the
+        // plain space char — tabs/newlines must normalize the same way.
+        assert_eq!(Shell::parse("\t bash \n"), Some(Shell::Bash));
+    }
+
+    #[test]
+    fn parse_does_not_strip_interior_whitespace() {
+        // Normalization is trim + case-fold ONLY. A space is not an alias
+        // separator: "product manager" must NOT resolve like
+        // "product-manager" does.
+        assert_eq!(Role::parse("product manager"), None);
+    }
+
+    #[test]
+    fn parse_case_folds_aliases_across_all_enums() {
+        // Case-folding must reach every enum's ALIAS arms, not just its
+        // primary variant name — one representative alias per enum.
+        assert_eq!(Target::parse("CLAUDE-CODE"), Some(Target::ClaudeCode));
+        assert_eq!(Domain::parse("FrontEnd"), Some(Domain::Web));
+        assert_eq!(Role::parse("PM"), Some(Role::ProductManager));
+        assert_eq!(Domain::parse("DEVOPS"), Some(Domain::Infra));
+    }
+
+    #[test]
+    fn parse_empty_and_whitespace_only_yields_none() {
+        assert_eq!(Shell::parse(""), None);
+        assert_eq!(Domain::parse("   "), None);
+    }
+
+    #[test]
+    fn parse_does_not_fold_non_ascii_case() {
+        // Documented ascii-only contract: `to_ascii_lowercase` leaves
+        // non-ASCII letters untouched, so a non-ASCII-cased token never
+        // accidentally matches a variant even under full Unicode folding.
+        assert_eq!(Shell::parse("BÄSH"), None);
+    }
+
+    #[test]
+    fn from_normalized_does_not_re_normalize_uppercase_input() {
+        // `from_normalized` trusts its caller (`parse`) to have already
+        // normalized; fed raw uppercase input directly, it must NOT match —
+        // proving normalization is `parse`'s job alone, never duplicated.
+        assert_eq!(Shell::from_normalized("BASH"), None);
+        assert_eq!(Domain::from_normalized("WEB"), None);
+    }
+
+    #[test]
+    fn inherent_parse_matches_trait_parse_for_sample_inputs() {
+        // The inherent `T::parse` on each enum must delegate faithfully to
+        // `<T as ArgEnum>::parse` — never hand-roll a diverging check.
+        for input in ["bash", "  ZSH ", "bogus"] {
+            assert_eq!(Shell::parse(input), <Shell as ArgEnum>::parse(input));
+        }
+        for input in ["claude", "GROK", "bogus"] {
+            assert_eq!(Target::parse(input), <Target as ArgEnum>::parse(input));
+        }
+    }
 }
