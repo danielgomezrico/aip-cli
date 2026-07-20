@@ -1,36 +1,11 @@
-//! Shell-hook generation (no-op; auto-on-cd is disabled), the `.aip-cli.toml`
-//! marker, a direnv-style trust store, and pure decision helpers kept for
-//! doctor/compat.
+//! The `.aip-cli.toml` marker, a direnv-style trust store, and pure decision
+//! helpers kept for doctor/compat. Auto-on-cd is disabled; use `aip-cli enable`.
 
-use crate::arg_enum::ArgEnum;
 use crate::config::{config_dir, MARKER_NAME};
 use crate::mode_apply::Target;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-
-/// Supported shells for hook emission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Shell {
-    Bash,
-    Zsh,
-}
-
-impl Shell {
-    pub fn parse(s: &str) -> Option<Shell> {
-        <Shell as ArgEnum>::parse(s)
-    }
-}
-
-impl ArgEnum for Shell {
-    fn from_normalized(token: &str) -> Option<Shell> {
-        match token {
-            "bash" => Some(Shell::Bash),
-            "zsh" => Some(Shell::Zsh),
-            _ => None,
-        }
-    }
-}
 
 /// Contents of a `.aip-cli.toml` marker file.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -50,6 +25,7 @@ pub enum MarkerTarget {
     #[default]
     Claude,
     Grok,
+    Pi,
 }
 
 impl From<MarkerTarget> for Target {
@@ -57,6 +33,7 @@ impl From<MarkerTarget> for Target {
         match t {
             MarkerTarget::Claude => Target::ClaudeCode,
             MarkerTarget::Grok => Target::Grok,
+            MarkerTarget::Pi => Target::Pi,
         }
     }
 }
@@ -74,6 +51,7 @@ impl Marker {
         match target {
             Some(MarkerTarget::Grok) => out.push_str("target = \"grok\"\n"),
             Some(MarkerTarget::Claude) => out.push_str("target = \"claude\"\n"),
+            Some(MarkerTarget::Pi) => out.push_str("target = \"pi\"\n"),
             None => {}
         }
         out
@@ -288,32 +266,11 @@ pub fn save_applied_hash(hash: &str) -> std::io::Result<()> {
     std::fs::write(path, hash)
 }
 
-// ─── shell hook ──────────────────────────────────────────────────────────────
-
-/// Emit a no-op shell snippet. Auto-on-cd is disabled; modes apply only via
-/// `aip-cli mode` / `aip-cli enable`. `shell` and `exe` are accepted so the
-/// `hook` CLI stays stable for anyone still eval'ing an old rc line.
-pub fn hook_script(shell: Shell, exe: &str) -> String {
-    let _ = (shell, exe);
-    String::from(
-        r#"# aip-cli: auto-on-cd is disabled.
-# Apply a folder mode manually with: aip-cli enable
-"#,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
-
-    #[test]
-    fn shell_parse() {
-        assert_eq!(Shell::parse("bash"), Some(Shell::Bash));
-        assert_eq!(Shell::parse("ZSH"), Some(Shell::Zsh));
-        assert_eq!(Shell::parse("fish"), None);
-    }
 
     #[test]
     fn marker_parse_defaults_target_to_none() {
@@ -477,18 +434,6 @@ mod tests {
         match decide(Some(m), true, None) {
             AutoAction::Invalid { .. } => {}
             other => panic!("expected Invalid, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn hook_script_is_noop_for_both_shells() {
-        for shell in [Shell::Bash, Shell::Zsh] {
-            let s = hook_script(shell, "/usr/local/bin/aip-cli");
-            assert!(s.contains("auto-on-cd is disabled"), "{s}");
-            assert!(!s.contains("PROMPT_COMMAND"), "{s}");
-            assert!(!s.contains("chpwd"), "{s}");
-            assert!(!s.contains("\" auto"), "{s}");
-            assert!(!s.contains("aip-cli auto"), "{s}");
         }
     }
 }

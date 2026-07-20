@@ -1,19 +1,22 @@
 //! Reading each AI agent's *current* plugin state from its on-disk config.
 //!
-//! [`crate::mode_apply`] only ever *writes* state (via `claude plugin
-//! enable/disable`); the `doctor` command needs to read it back. The two agents
-//! store this differently:
+//! [`crate::mode_apply`] writes state via host CLIs; the `doctor` command needs
+//! to read it back. Agents store this differently:
 //!
 //! * Claude Code — `~/.claude/settings.json`, key `enabledPlugins`: a map of
 //!   `"<name>@<marketplace>" -> bool` (the plugin name is the part before `@`).
 //! * Grok — `~/.grok/config.toml`, table `[plugins]` with `enabled` and
 //!   `disabled` string arrays.
+//! * Pi — `~/.pi/agent/settings.json`, key `packages`: array of local paths
+//!   (or npm/git sources). Aip-cli installs store plugins as local package
+//!   paths; the last path component is the plugin name.
 //!
 //! Parsing is pure and unit-tested; the thin [`read_state`] wrapper does the
 //! filesystem read and is the only part that touches disk.
 
 use crate::mode_apply::Target;
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -109,6 +112,65 @@ pub fn parse_grok(config_toml: &str) -> AgentPlugins {
     AgentPlugins::normalized(parsed.plugins.enabled, parsed.plugins.disabled)
 }
 
+// ─── Pi: ~/.pi/agent/settings.json ───────────────────────────────────────────
+
+/// Parse Pi's `packages` array into enabled plugin names. Entries may be strings
+/// (`"../../.aip-cli/plugins/product"`) or objects (`{"source":"..."}`). The
+/// plugin name is the last path segment of a local path (or the raw source for
+/// npm/git). Malformed JSON yields empty.
+pub fn parse_pi(settings_json: &str) -> AgentPlugins {
+    let Ok(v) = serde_json::from_str::<Value>(settings_json) else {
+        return AgentPlugins::default();
+    };
+    let Some(packages) = v.get("packages").and_then(|p| p.as_array()) else {
+        return AgentPlugins::default();
+    };
+    let mut enabled = Vec::new();
+    for entry in packages {
+        let source = match entry {
+            Value::String(s) => s.as_str(),
+            Value::Object(m) => m
+                .get("source")
+                .and_then(|s| s.as_str())
+                .unwrap_or(""),
+            _ => "",
+        };
+        if source.is_empty() {
+            continue;
+        }
+        if let Some(name) = pi_package_plugin_name(source) {
+            enabled.push(name);
+        }
+    }
+    AgentPlugins::normalized(enabled, Vec::new())
+}
+
+/// Best-effort plugin name from a pi package source string.
+fn pi_package_plugin_name(source: &str) -> Option<String> {
+    let s = source.trim().trim_end_matches('/');
+    if s.is_empty() {
+        return None;
+    }
+    // Local path (absolute, relative, or ./...) — last component is the name.
+    // npm:/git: sources keep the package id after the scheme.
+    let name = if let Some(rest) = s.strip_prefix("npm:") {
+        rest.rsplit('/').next().unwrap_or(rest)
+    } else if let Some(rest) = s.strip_prefix("git:") {
+        rest.rsplit('/').next().unwrap_or(rest)
+    } else {
+        Path::new(s)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(s)
+    };
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 // ─── filesystem ──────────────────────────────────────────────────────────────
 
 /// The config file that holds `target`'s plugin state, relative to `home`.
@@ -116,6 +178,7 @@ pub fn state_path(target: Target, home: &Path) -> PathBuf {
     match target {
         Target::ClaudeCode => home.join(".claude").join("settings.json"),
         Target::Grok => home.join(".grok").join("config.toml"),
+        Target::Pi => home.join(".pi").join("agent").join("settings.json"),
     }
 }
 
@@ -126,6 +189,7 @@ pub fn read_state(target: Target, home: &Path) -> Option<AgentPlugins> {
     Some(match target {
         Target::ClaudeCode => parse_claude(&text),
         Target::Grok => parse_grok(&text),
+        Target::Pi => parse_pi(&text),
     })
 }
 
@@ -211,6 +275,35 @@ disabled = ["software-engineer", "product"]
     }
 
     #[test]
+    fn parse_pi_local_paths_and_object_form() {
+        let json = r#"{
+            "defaultModel": "x",
+            "packages": [
+                "../../.aip-cli/plugins/product",
+                {"source": "/Users/x/.aip-cli/plugins/software-engineer", "skills": []},
+                "npm:@foo/bar",
+                ""
+            ]
+        }"#;
+        let p = parse_pi(json);
+        assert_eq!(
+            p.enabled,
+            vec!["bar", "product", "software-engineer"]
+        );
+        assert!(p.disabled.is_empty());
+    }
+
+    #[test]
+    fn parse_pi_missing_or_malformed_is_empty() {
+        assert_eq!(parse_pi("{}"), AgentPlugins::default());
+        assert_eq!(parse_pi("{not json"), AgentPlugins::default());
+        assert_eq!(
+            parse_pi(r#"{"packages":[]}"#),
+            AgentPlugins::default()
+        );
+    }
+
+    #[test]
     fn state_path_per_target() {
         let home = Path::new("/home/x");
         assert_eq!(
@@ -221,6 +314,10 @@ disabled = ["software-engineer", "product"]
             state_path(Target::Grok, home),
             Path::new("/home/x/.grok/config.toml")
         );
+        assert_eq!(
+            state_path(Target::Pi, home),
+            Path::new("/home/x/.pi/agent/settings.json")
+        );
     }
 
     #[test]
@@ -228,6 +325,7 @@ disabled = ["software-engineer", "product"]
         let tmp = tempfile::TempDir::new().unwrap();
         assert!(read_state(Target::ClaudeCode, tmp.path()).is_none());
         assert!(read_state(Target::Grok, tmp.path()).is_none());
+        assert!(read_state(Target::Pi, tmp.path()).is_none());
     }
 
     #[test]

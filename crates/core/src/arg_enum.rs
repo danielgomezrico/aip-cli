@@ -1,5 +1,5 @@
 //! Shared parsing contract for small, case-insensitive CLI/marker argument
-//! enums (`Shell`, `Target`, `Role`, `Domain`, ...).
+//! enums (`Target`, `Role`, `Domain`, ...).
 //!
 //! Each of these enums has historically hand-rolled the same normalization
 //! boilerplate at the top of its `parse`: `s.trim().to_ascii_lowercase()`
@@ -26,14 +26,8 @@ pub trait ArgEnum: Sized {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hook::Shell;
     use crate::mode_apply::Target;
     use crate::modes::{Domain, Role};
-
-    #[test]
-    fn parse_normalizes_whitespace_and_case_shell() {
-        assert_eq!(Shell::parse("  BASH "), Some(Shell::Bash));
-    }
 
     #[test]
     fn parse_normalizes_whitespace_and_case_target() {
@@ -42,7 +36,6 @@ mod tests {
 
     #[test]
     fn parse_unknown_token_yields_none() {
-        assert_eq!(Shell::parse("powershell"), None);
         assert_eq!(Target::parse("bogus"), None);
         assert_eq!(Role::parse("bogus"), None);
         assert_eq!(Domain::parse("bogus"), None);
@@ -53,7 +46,7 @@ mod tests {
         // Bypasses `parse`'s trim+lowercase step entirely: the input is
         // already in normalized form, so `from_normalized` must match it
         // directly without re-normalizing.
-        assert_eq!(Shell::from_normalized("zsh"), Some(Shell::Zsh));
+        assert_eq!(Target::from_normalized("grok"), Some(Target::Grok));
     }
 
     #[test]
@@ -69,7 +62,7 @@ mod tests {
     fn parse_trims_tabs_and_newlines_not_just_spaces() {
         // `.trim()` strips all ASCII (and Unicode) whitespace, not just the
         // plain space char — tabs/newlines must normalize the same way.
-        assert_eq!(Shell::parse("\t bash \n"), Some(Shell::Bash));
+        assert_eq!(Target::parse("\t grok \n"), Some(Target::Grok));
     }
 
     #[test]
@@ -92,7 +85,7 @@ mod tests {
 
     #[test]
     fn parse_empty_and_whitespace_only_yields_none() {
-        assert_eq!(Shell::parse(""), None);
+        assert_eq!(Target::parse(""), None);
         assert_eq!(Domain::parse("   "), None);
     }
 
@@ -101,7 +94,7 @@ mod tests {
         // Documented ascii-only contract: `to_ascii_lowercase` leaves
         // non-ASCII letters untouched, so a non-ASCII-cased token never
         // accidentally matches a variant even under full Unicode folding.
-        assert_eq!(Shell::parse("BÄSH"), None);
+        assert_eq!(Domain::parse("WËB"), None);
     }
 
     #[test]
@@ -109,7 +102,7 @@ mod tests {
         // `from_normalized` trusts its caller (`parse`) to have already
         // normalized; fed raw uppercase input directly, it must NOT match —
         // proving normalization is `parse`'s job alone, never duplicated.
-        assert_eq!(Shell::from_normalized("BASH"), None);
+        assert_eq!(Target::from_normalized("GROK"), None);
         assert_eq!(Domain::from_normalized("WEB"), None);
     }
 
@@ -117,11 +110,11 @@ mod tests {
     fn inherent_parse_matches_trait_parse_for_sample_inputs() {
         // The inherent `T::parse` on each enum must delegate faithfully to
         // `<T as ArgEnum>::parse` — never hand-roll a diverging check.
-        for input in ["bash", "  ZSH ", "bogus"] {
-            assert_eq!(Shell::parse(input), <Shell as ArgEnum>::parse(input));
-        }
         for input in ["claude", "GROK", "bogus"] {
             assert_eq!(Target::parse(input), <Target as ArgEnum>::parse(input));
+        }
+        for input in ["web", "  FRONTEND ", "bogus"] {
+            assert_eq!(Domain::parse(input), <Domain as ArgEnum>::parse(input));
         }
     }
 }

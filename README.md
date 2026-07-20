@@ -21,7 +21,7 @@ aip-cli keeps everything installed but only activates what you explicitly enable
 ## How it works
 
 - Put a `.aip-cli.toml` in a project folder (or let `aip-cli mode` write one).
-- Run `aip-cli enable` to apply that mode: `claude`/`grok plugin enable|disable` for the right set.
+- Run `aip-cli enable` to apply that mode: `claude`/`grok plugin enable|disable`, and `pi install|remove` for the right set.
 - Nothing runs on `cd`. Modes only change when you run `mode` or `enable`.
 
 ## Install
@@ -35,15 +35,6 @@ git clone https://github.com/dan/aip-cli.git && cd aip-cli && make install
 ## Quick start
 
 ```bash
-# once: tab completion
-# bash (easiest):
-source <(aip-cli completion bash)
-# bash (persistent):
-#   aip-cli completion bash > ~/.local/share/bash-completion/completions/aip-cli
-# zsh (persistent):
-#   mkdir -p ~/.zfunc && aip-cli completion zsh > ~/.zfunc/_aip-cli
-#   # then in ~/.zshrc: fpath=(~/.zfunc $fpath); autoload -Uz compinit; compinit
-
 # in a project: pick a mode — applies now and writes .aip-cli.toml
 aip-cli mode mobile
 
@@ -75,7 +66,7 @@ A read-only health check, all in one shot:
 
 - **Project** — the `.aip-cli.toml` in scope, the mode it picks and plugins it enables, whether it's trusted and active.
 - **Store** — every plugin in `~/.aip-cli/plugins`, with versions.
-- **AI CLIs** — per agent (`claude`, `grok`): installed? which plugins are enabled vs disabled (read from `~/.claude/settings.json` and `~/.grok/config.toml`).
+- **AI CLIs** — per agent (`claude`, `grok`, `pi`): installed? which plugins are enabled vs disabled (read from `~/.claude/settings.json`, `~/.grok/config.toml`, and `~/.pi/agent/settings.json`).
 
 It flags drift (an agent missing a plugin its mode wants), orphans (enabled on an agent but not in the store), and plugins a mode wants that the store lacks. Store and per-agent reads run in parallel.
 

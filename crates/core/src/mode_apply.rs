@@ -7,17 +7,19 @@ use crate::store;
 use rayon::prelude::*;
 use std::path::Path;
 
-/// Which host CLI receives the `plugin enable/disable` calls.
+/// Which host CLI receives the mode apply calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     ClaudeCode,
     Grok,
+    /// Pi coding agent — uses `pi install` / `pi remove` on store plugin paths
+    /// (no `plugin enable|disable` subcommand).
+    Pi,
 }
 
-/// Every AI agent the CLI can drive, i.e. every host CLI that exposes a
-/// `plugin enable/disable` interface. A mode is applied to all of these that are
+/// Every AI agent the CLI can drive. A mode is applied to all of these that are
 /// actually installed, so the user never has to pick one.
-pub const ALL_TARGETS: [Target; 2] = [Target::ClaudeCode, Target::Grok];
+pub const ALL_TARGETS: [Target; 3] = [Target::ClaudeCode, Target::Grok, Target::Pi];
 
 impl Target {
     /// The program name to invoke.
@@ -25,6 +27,7 @@ impl Target {
         match self {
             Target::ClaudeCode => "claude",
             Target::Grok => "grok",
+            Target::Pi => "pi",
         }
     }
 
@@ -33,10 +36,11 @@ impl Target {
         match self {
             Target::ClaudeCode => "claude",
             Target::Grok => "grok",
+            Target::Pi => "pi",
         }
     }
 
-    /// Parse a target from its key (`claude` / `grok`).
+    /// Parse a target from its key (`claude` / `grok` / `pi`).
     pub fn parse(s: &str) -> Option<Target> {
         <Target as ArgEnum>::parse(s)
     }
@@ -46,6 +50,7 @@ impl Target {
         match self {
             Target::ClaudeCode => "mode",
             Target::Grok => "mode-grok",
+            Target::Pi => "mode-pi",
         }
     }
 }
@@ -55,6 +60,7 @@ impl ArgEnum for Target {
         match token {
             "claude" | "claude-code" | "claudecode" => Some(Target::ClaudeCode),
             "grok" => Some(Target::Grok),
+            "pi" => Some(Target::Pi),
             _ => None,
         }
     }
@@ -84,9 +90,9 @@ pub fn is_on_path(program: &str) -> bool {
 }
 
 /// One enable/disable decision for a plugin, and whether the host CLI accepted
-/// it. `success == false` means the `plugin enable/disable` call exited non-zero
-/// (e.g. the agent doesn't know that plugin name) — the run continues, but the
-/// caller can surface it instead of pretending the plugin is now enabled.
+/// it. `success == false` means the host call exited non-zero (e.g. the agent
+/// doesn't know that plugin name) — the run continues, but the caller can
+/// surface it instead of pretending the plugin is now enabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Action {
     pub plugin: String,
@@ -94,19 +100,29 @@ pub struct Action {
     pub success: bool,
 }
 
-/// Apply `resolution` against `target`, running `<prog> plugin enable|disable`
-/// for every plugin **sequentially** in canonical order. The calls must NOT run
-/// in parallel: each `claude/grok plugin enable|disable` does a read-modify-write
-/// of the same host config file (`~/.grok/config.toml`, claude's settings), and
-/// concurrent invocations clobber each other — a torn write leaves trailing bytes
-/// from a longer previous version, corrupting the TOML/JSON so every later command
-/// fails to parse (observed: grok config truncated mid-array). Different *targets*
-/// touch different files, so cross-target parallelism (in [`apply_targets`]) stays
-/// safe; only within a target must the writes serialize.
+/// Apply `resolution` against `target`.
 ///
-/// Failures of individual enable/disable calls are tolerated (matching the
-/// original `|| true`); the returned vec lists the actions in canonical order.
+/// * Claude / Grok — sequential `<prog> plugin enable|disable` (must NOT run in
+///   parallel: each does a read-modify-write of the same host config file).
+/// * Pi — sequential `pi install|remove <store/plugin>` (packages list in
+///   `~/.pi/agent/settings.json`; no `plugin enable|disable` API).
+///
+/// Failures of individual calls are tolerated (matching the original `|| true`);
+/// the returned vec lists the actions in canonical order.
 pub fn apply_mode<R: CommandRunner + Send + Sync + ?Sized>(
+    resolution: &Resolution,
+    target: Target,
+    cwd: &Path,
+    runner: &R,
+) -> std::io::Result<Vec<Action>> {
+    match target {
+        Target::Pi => apply_mode_pi(resolution, cwd, runner),
+        Target::ClaudeCode | Target::Grok => apply_mode_plugin_cli(resolution, target, cwd, runner),
+    }
+}
+
+/// Claude/Grok path: `plugin enable|disable` (+ grok store pre-install).
+fn apply_mode_plugin_cli<R: CommandRunner + Send + Sync + ?Sized>(
     resolution: &Resolution,
     target: Target,
     cwd: &Path,
@@ -142,6 +158,55 @@ pub fn apply_mode<R: CommandRunner + Send + Sync + ?Sized>(
                 enable,
                 success: outcome.success,
             })
+        })
+        .collect()
+}
+
+/// Pi path: install store plugins that should be on, remove those that should
+/// be off. Local packages point at `~/.aip-cli/plugins/<name>`; pi loads their
+/// conventional `skills/` (and friends) without a Claude-style plugin registry.
+fn apply_mode_pi<R: CommandRunner + Send + Sync + ?Sized>(
+    resolution: &Resolution,
+    cwd: &Path,
+    runner: &R,
+) -> std::io::Result<Vec<Action>> {
+    let (on, _off) = resolution.partition();
+    let store = store::plugins_dir();
+
+    crate::modes::all_plugins()
+        .into_iter()
+        .map(|plugin| {
+            let enable = on.contains(&plugin);
+            let pdir = store.join(&plugin);
+            let pstr = pdir.to_string_lossy().into_owned();
+
+            if enable {
+                if !pdir.is_dir() {
+                    // Nothing to install — mark failed so the CLI can surface it.
+                    return Ok(Action {
+                        plugin,
+                        enable: true,
+                        success: false,
+                    });
+                }
+                let inv = Invocation::new("pi", &["install", &pstr], cwd);
+                let outcome = runner.run(&inv)?;
+                Ok(Action {
+                    plugin,
+                    enable: true,
+                    success: outcome.success,
+                })
+            } else {
+                // Remove even if never installed; pi is a no-op with "No matching
+                // package" and still exits cleanly for identity mismatches.
+                let inv = Invocation::new("pi", &["remove", &pstr], cwd);
+                let outcome = runner.run(&inv)?;
+                Ok(Action {
+                    plugin,
+                    enable: false,
+                    success: outcome.success,
+                })
+            }
         })
         .collect()
 }
@@ -235,11 +300,87 @@ mod tests {
     }
 
     #[test]
+    fn pi_target_installs_on_and_removes_off() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_home = TempDir::new().unwrap();
+        let store_plugins = temp_home.path().join(".aip-cli").join("plugins");
+        fs::create_dir_all(store_plugins.join("ai-architecture")).unwrap();
+        fs::create_dir_all(store_plugins.join("software-engineer")).unwrap();
+
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", temp_home.path());
+
+        let res = resolve("minimal").unwrap();
+        let runner = RecordingRunner::new();
+        let actions = apply_mode(&res, Target::Pi, &PathBuf::from("/repo"), &runner).unwrap();
+
+        if let Some(h) = old_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        let n = crate::modes::all_plugins().len();
+        assert_eq!(actions.len(), n);
+        assert_eq!(runner.lines().len(), n);
+
+        let lines = runner.lines();
+        assert!(lines.iter().all(|l| l.starts_with("pi ")));
+        // Enabled plugins present in store → install.
+        assert!(lines.iter().any(|l| {
+            l.starts_with("pi install ") && l.contains("ai-architecture")
+        }));
+        assert!(lines.iter().any(|l| {
+            l.starts_with("pi install ") && l.contains("software-engineer")
+        }));
+        // Off plugins → remove (even when not in store).
+        assert!(lines.iter().any(|l| l.starts_with("pi remove ") && l.contains("flutter")));
+        // Wanted enables that had dirs reported success.
+        let on_ok: Vec<_> = actions.iter().filter(|a| a.enable && a.success).collect();
+        assert_eq!(on_ok.len(), 2);
+        // Wanted enables missing from store would fail — none missing here.
+        assert!(!actions.iter().any(|a| a.enable && !a.success));
+    }
+
+    #[test]
+    fn pi_enable_fails_when_plugin_missing_from_store() {
+        use tempfile::TempDir;
+
+        let temp_home = TempDir::new().unwrap();
+        // Empty store — minimal's plugins are absent.
+        std::fs::create_dir_all(temp_home.path().join(".aip-cli").join("plugins")).unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", temp_home.path());
+
+        let res = resolve("minimal").unwrap();
+        let runner = RecordingRunner::new();
+        let actions = apply_mode(&res, Target::Pi, &PathBuf::from("/r"), &runner).unwrap();
+
+        if let Some(h) = old_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        // Enables fail (no store dir); no install calls issued for them.
+        assert_eq!(actions.iter().filter(|a| a.enable && !a.success).count(), 2);
+        assert!(!runner.lines().iter().any(|l| l.starts_with("pi install ")));
+        // Removes still issued for the rest of the catalog.
+        assert!(runner.lines().iter().any(|l| l.starts_with("pi remove ")));
+    }
+
+    #[test]
     fn target_parse_and_key() {
         assert_eq!(Target::parse("claude"), Some(Target::ClaudeCode));
         assert_eq!(Target::parse("GROK"), Some(Target::Grok));
+        assert_eq!(Target::parse("pi"), Some(Target::Pi));
+        assert_eq!(Target::parse("PI"), Some(Target::Pi));
         assert_eq!(Target::parse("gemini"), None);
         assert_eq!(Target::ClaudeCode.key(), "claude");
+        assert_eq!(Target::Pi.key(), "pi");
+        assert_eq!(Target::Pi.program(), "pi");
     }
 
     #[test]
@@ -258,22 +399,28 @@ mod tests {
         let res = resolve("minimal").unwrap();
         let runner = RecordingRunner::new();
         let reports = apply_targets(&res, &ALL_TARGETS, &PathBuf::from("/repo"), &runner).unwrap();
-        assert_eq!(reports.len(), 2);
+        assert_eq!(reports.len(), 3);
         assert_eq!(reports[0].target, Target::ClaudeCode);
         assert_eq!(reports[1].target, Target::Grok);
+        assert_eq!(reports[2].target, Target::Pi);
 
         // Compute expected pre-installs based on *actual* store state at test time
         // (makes test robust across machines with/without populated ~/.aip-cli/plugins).
         let store = store::plugins_dir();
-        let grok_preinstalls = res
-            .enabled
-            .iter()
-            .filter(|name| store.join(name).is_dir())
-            .count();
+        let (on, _) = res.partition();
+        let grok_preinstalls = on.iter().filter(|name| store.join(name).is_dir()).count();
+        // Pi install only for enabled plugins present in the store; remove for the rest.
+        let pi_installs = on.iter().filter(|name| store.join(name).is_dir()).count();
+        let pi_removes = crate::modes::all_plugins().len() - on.len();
+        // When store lacks enabled plugins, pi issues no install (counts as failed enable).
+        let pi_calls = pi_installs + pi_removes;
 
-        // Claude: n calls. Grok: n calls + preinstalls for this target.
+        // Claude: n. Grok: n + preinstalls. Pi: installs for present-on + removes for off.
         let n = crate::modes::all_plugins().len();
-        assert_eq!(runner.lines().len(), 2 * n + grok_preinstalls);
+        assert_eq!(
+            runner.lines().len(),
+            n + n + grok_preinstalls + pi_calls
+        );
 
         assert!(runner
             .lines()
@@ -281,6 +428,7 @@ mod tests {
         assert!(runner
             .lines()
             .contains(&"grok plugin enable ai-architecture".to_string()));
+        assert!(runner.lines().iter().any(|l| l.starts_with("pi ")));
     }
 
     #[test]

@@ -294,7 +294,7 @@ fn render_project(r: &DoctorReport, out: &mut String) {
     let (icon, trust) = if p.trusted {
         (OK, "trusted")
     } else {
-        (WARN, "untrusted — run `aip-cli allow` if you use trust checks")
+        (WARN, "untrusted — re-run `aip-cli mode` to trust the marker")
     };
     out.push_str(&format!("  {icon} trust: {trust}\n"));
 
@@ -330,7 +330,7 @@ fn render_store(r: &DoctorReport, out: &mut String) {
     ));
     if r.store.is_empty() {
         out.push_str(&format!(
-            "  {OFF} empty (ingest with `aip-cli ingest <folder-or-git-url>`)\n"
+            "  {OFF} empty (ingest with `aip-cli setup <folder-or-git-url>`)\n"
         ));
         return;
     }
