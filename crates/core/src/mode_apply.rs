@@ -304,23 +304,17 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
-        let temp_home = TempDir::new().unwrap();
-        let store_plugins = temp_home.path().join(".aip-cli").join("plugins");
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join(".aip-cli");
+        let store_plugins = store.join("plugins");
         fs::create_dir_all(store_plugins.join("ai-architecture")).unwrap();
         fs::create_dir_all(store_plugins.join("software-engineer")).unwrap();
 
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", temp_home.path());
-
         let res = resolve("minimal").unwrap();
         let runner = RecordingRunner::new();
-        let actions = apply_mode(&res, Target::Pi, &PathBuf::from("/repo"), &runner).unwrap();
-
-        if let Some(h) = old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
+        let actions = store::with_store_dir(&store, || {
+            apply_mode(&res, Target::Pi, &PathBuf::from("/repo"), &runner).unwrap()
+        });
 
         let n = crate::modes::all_plugins().len();
         assert_eq!(actions.len(), n);
@@ -348,21 +342,16 @@ mod tests {
     fn pi_enable_fails_when_plugin_missing_from_store() {
         use tempfile::TempDir;
 
-        let temp_home = TempDir::new().unwrap();
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join(".aip-cli");
         // Empty store — minimal's plugins are absent.
-        std::fs::create_dir_all(temp_home.path().join(".aip-cli").join("plugins")).unwrap();
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", temp_home.path());
+        std::fs::create_dir_all(store.join("plugins")).unwrap();
 
         let res = resolve("minimal").unwrap();
         let runner = RecordingRunner::new();
-        let actions = apply_mode(&res, Target::Pi, &PathBuf::from("/r"), &runner).unwrap();
-
-        if let Some(h) = old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
+        let actions = store::with_store_dir(&store, || {
+            apply_mode(&res, Target::Pi, &PathBuf::from("/r"), &runner).unwrap()
+        });
 
         // Enables fail (no store dir); no install calls issued for them.
         assert_eq!(actions.iter().filter(|a| a.enable && !a.success).count(), 2);
@@ -469,33 +458,23 @@ mod tests {
 
     #[test]
     fn grok_preinstall_only_for_plugins_present_in_store() {
-        // TDD iteration 1: control the aip store via HOME to simulate partial ingest.
-        // "minimal" enables ai-architecture + software-engineer.
-        // Create dir only for one of them under a temp store.
+        // Partial ingest: only one of minimal's plugins exists in the store.
         use std::fs;
         use tempfile::TempDir;
 
-        let temp_home = TempDir::new().unwrap();
-        let store_plugins = temp_home.path().join(".aip-cli").join("plugins");
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join(".aip-cli");
+        let store_plugins = store.join("plugins");
         fs::create_dir_all(&store_plugins).unwrap();
 
-        // Only "ai-architecture" present in this fake store (simulates partial ingest).
-        let present = store_plugins.join("ai-architecture");
-        fs::create_dir_all(&present).unwrap();
-
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", temp_home.path());
+        // Only "ai-architecture" present (simulates partial ingest).
+        fs::create_dir_all(store_plugins.join("ai-architecture")).unwrap();
 
         let res = resolve("minimal").unwrap();
         let runner = RecordingRunner::new();
-        let _ = apply_mode(&res, Target::Grok, &PathBuf::from("/repo"), &runner);
-
-        // Restore
-        if let Some(h) = old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
+        store::with_store_dir(&store, || {
+            let _ = apply_mode(&res, Target::Grok, &PathBuf::from("/repo"), &runner);
+        });
 
         let lines = runner.lines();
 

@@ -7,11 +7,21 @@
 //! every AI agent on the machine.
 
 use crate::manifest::PluginManifest;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+
+thread_local! {
+    /// Test-only override for [`store_dir`]. Thread-local so parallel tests
+    /// never race on process-global `HOME`.
+    static STORE_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
 
 /// Root of the per-user store: `~/.aip-cli` (falls back to `./.aip-cli` when the
 /// home directory cannot be determined).
 pub fn store_dir() -> PathBuf {
+    if let Some(dir) = STORE_DIR_OVERRIDE.with(|c| c.borrow().clone()) {
+        return dir;
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".aip-cli")
@@ -20,6 +30,23 @@ pub fn store_dir() -> PathBuf {
 /// Directory holding ingested plugins: `<store_dir>/plugins`.
 pub fn plugins_dir() -> PathBuf {
     store_dir().join("plugins")
+}
+
+/// Run `f` with [`store_dir`] / [`plugins_dir`] resolving to `dir` (as if that
+/// path were `~/.aip-cli`). Thread-local and panic-safe — used by tests so they
+/// never mutate process-global `HOME` under parallel `cargo test`.
+#[cfg(test)]
+pub fn with_store_dir<T>(dir: impl Into<PathBuf>, f: impl FnOnce() -> T) -> T {
+    let dir = dir.into();
+    STORE_DIR_OVERRIDE.with(|c| {
+        let prev = c.borrow_mut().replace(dir);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        *c.borrow_mut() = prev;
+        match result {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    })
 }
 
 /// True when `dir` looks like a Claude plugin: it has a
@@ -212,6 +239,18 @@ mod tests {
     fn plugins_dir_ends_with_plugins() {
         assert!(plugins_dir().ends_with("plugins"));
         assert!(store_dir().ends_with(".aip-cli"));
+    }
+
+    #[test]
+    fn with_store_dir_overrides_and_restores() {
+        let tmp = TempDir::new().unwrap();
+        let custom = tmp.path().join("custom-store");
+        let baseline = store_dir();
+        with_store_dir(&custom, || {
+            assert_eq!(store_dir(), custom);
+            assert_eq!(plugins_dir(), custom.join("plugins"));
+        });
+        assert_eq!(store_dir(), baseline);
     }
 
     #[test]
