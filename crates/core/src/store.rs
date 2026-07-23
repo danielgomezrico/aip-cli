@@ -311,6 +311,33 @@ mod tests {
     }
 
     #[test]
+    fn install_plugin_replace_wipes_nested_internals_not_in_source() {
+        // Whole-plugin replace guarantee: a re-install must leave *nothing* from
+        // the previous copy behind — including files in nested subdirectories
+        // that the new source no longer contains. This is the `remove_dir_all` +
+        // `copy_dir_all` contract every setup path (folder ingest, git URL, bare
+        // setup) funnels through.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("p");
+        make_plugin(&src, "p");
+        let store = tmp.path().join("store");
+
+        let dest = install_plugin(&src, &store).unwrap();
+        // Pollute the installed copy with stale internals at several depths.
+        fs::create_dir_all(dest.join("skills").join("old")).unwrap();
+        fs::write(dest.join("skills").join("old").join("stale.md"), "old").unwrap();
+        fs::write(dest.join(".claude-plugin").join("extra.json"), "junk").unwrap();
+
+        // Re-install the (unchanged) source: the whole slot is rebuilt.
+        install_plugin(&src, &store).unwrap();
+        assert!(!dest.join("skills").exists(), "nested stale dir survived");
+        assert!(!dest.join(".claude-plugin").join("extra.json").exists());
+        // Fresh manifest + README are present.
+        assert!(is_plugin_dir(&dest));
+        assert_eq!(fs::read_to_string(dest.join("README.md")).unwrap(), "hello");
+    }
+
+    #[test]
     fn install_plugin_refuses_to_clobber_different_plugin() {
         let tmp = TempDir::new().unwrap();
         let store = tmp.path().join("store");

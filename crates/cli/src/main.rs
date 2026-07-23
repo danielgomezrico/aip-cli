@@ -10,6 +10,8 @@ use std::path::PathBuf;
 
 use aip_core::agent_state::read_state;
 use aip_core::categories;
+use aip_core::claude_plugins;
+use aip_core::grok_plugins;
 use aip_core::config::{canonicalize_dir, canonicalize_or_self, config_dir, find_repo_root, MARKER_NAME};
 use aip_core::discovery::{discover_plugins, plugins_root};
 use aip_core::doctor::{self, AgentInput, ProjectInput, StorePlugin};
@@ -21,7 +23,7 @@ use aip_core::ingest::{ingest_folder_with, ingest_url};
 use aip_core::manifest::PluginManifest;
 use aip_core::mode_apply::{apply_targets, available, is_on_path, Target, ALL_TARGETS};
 use aip_core::modes::{self, resolve};
-use aip_core::runner::{CommandRunner, Invocation, SystemRunner};
+use aip_core::runner::SystemRunner;
 use aip_core::setup::{is_linked, run_setup};
 use aip_core::store;
 
@@ -153,7 +155,9 @@ fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Re
             let dest = store::plugins_dir();
             std::fs::create_dir_all(&dest)
                 .with_context(|| format!("creating store {}", dest.display()))?;
-            // Always overwrite when ingesting as part of setup.
+            // Always overwrite when ingesting as part of setup: install_plugin_with
+            // does remove_dir_all + copy_dir_all, so an existing slot is replaced
+            // whole (no stale internals survive).
             let _ = ingest_folder_with(&folder, &dest, &mut |_| true)?;
         }
     }
@@ -205,15 +209,37 @@ fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Re
         println!("  {icon} {:<8} {}", s.phase, s.plugin);
     }
 
-    // Also ensure the plugins are installed for grok (registers local path so
-    // `grok plugin enable` works for ingested plugins like flutter/android/apple).
+    // Against the store, guarantee each plugin is installed for Claude and
+    // serving the store's latest code: refresh the marketplace (re-register on
+    // installLocation drift, else `marketplace update`), then `plugin install`
+    // it if installed_plugins.json doesn't already list it. Keyed by the plugin's
+    // manifest + marketplace names (not the store dir). Skipped for a source-repo
+    // run (`vendor`): there the marketplace `add` is the plugin's own `make setup`.
+    if !vendor && is_on_path("claude") {
+        let store_root = store::plugins_dir();
+        for p in &plugins {
+            let marketplace = claude_plugins::resolve_marketplace_name(&p.path, &p.dir_name);
+            claude_plugins::sync_installed_plugin(
+                &runner,
+                &home,
+                &store_root,
+                &p.dir_name,
+                &p.name,
+                &marketplace,
+                &p.path,
+            );
+        }
+    }
+
+    // Ensure grok serves the store's latest code for each plugin. A blind
+    // `grok plugin install` hard-fails ("repo already installed") and leaves
+    // stale/duplicate registrations, so replace_plugin uninstalls every
+    // registration of the name first, then installs fresh from the store path.
     if is_on_path("grok") {
         for p in &plugins {
-            let pstr = p.path.to_string_lossy().into_owned();
-            // `--trust` is required for directory installs: grok refuses an
-            // interactive-confirmation prompt in this non-tty context otherwise.
-            let inv = Invocation::new("grok", &["plugin", "install", &pstr, "--trust"], &p.path);
-            let _ = runner.run(&inv);
+            grok_plugins::replace_plugin(&runner, &p.name, &p.path, &p.path, || {
+                grok_plugins::capture_list(&p.path)
+            });
         }
     }
 

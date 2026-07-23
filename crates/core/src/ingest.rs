@@ -176,6 +176,46 @@ mod tests {
     }
 
     #[test]
+    fn ingest_folder_replace_wipes_stale_internals() {
+        // The folder-ingest setup path must fully replace an existing store copy:
+        // a re-ingest with overwrite leaves no file from the prior copy behind,
+        // even one nested in a subdir the new source doesn't have.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("incoming");
+        make_plugin(&src.join("alpha"), "alpha");
+        let store = tmp.path().join("store");
+
+        ingest_folder(&src, &store).unwrap();
+        let dest = store.join("alpha");
+        fs::create_dir_all(dest.join("agents")).unwrap();
+        fs::write(dest.join("agents").join("stale.md"), "old").unwrap();
+
+        // Re-ingest with overwrite approval (the policy `setup` uses).
+        ingest_folder_with(&src, &store, &mut |_| true).unwrap();
+        assert!(!dest.join("agents").exists(), "stale nested dir survived re-ingest");
+        assert!(is_plugin_dir(&dest));
+    }
+
+    #[test]
+    fn place_clone_replace_wipes_stale_internals() {
+        // The git-URL setup path (clone → place_clone → install_plugin) must also
+        // fully replace an existing store copy.
+        let tmp = TempDir::new().unwrap();
+        let co = tmp.path().join("co");
+        make_plugin(&co.join("my-plugin"), "my");
+        let store = tmp.path().join("store");
+
+        place_clone(&co, "https://example.com/p.git", &store).unwrap();
+        let dest = store.join("my-plugin");
+        fs::create_dir_all(dest.join("cache")).unwrap();
+        fs::write(dest.join("cache").join("stale.bin"), "old").unwrap();
+
+        place_clone(&co, "https://example.com/p.git", &store).unwrap();
+        assert!(!dest.join("cache").exists(), "stale nested dir survived re-clone");
+        assert!(is_plugin_dir(&dest));
+    }
+
+    #[test]
     fn ingest_folder_empty_when_none_are_plugins() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("incoming");

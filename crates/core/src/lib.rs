@@ -8,9 +8,11 @@
 pub mod agent_state;
 pub mod arg_enum;
 pub mod categories;
+pub mod claude_plugins;
 pub mod config;
 pub mod discovery;
 pub mod doctor;
+pub mod grok_plugins;
 pub mod hook;
 pub mod ingest;
 pub mod manifest;

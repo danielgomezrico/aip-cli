@@ -261,9 +261,9 @@ mod tests {
         assert_eq!(actions.len(), crate::modes::all_plugins().len());
 
         // Actions are returned in canonical order.
-        assert_eq!(actions[0].enable, true);
+        assert!(actions[0].enable);
         assert_eq!(actions[0].plugin, "ai-architecture");
-        assert_eq!(actions[1].enable, true);
+        assert!(actions[1].enable);
         assert_eq!(actions[1].plugin, "software-engineer");
 
         // Check runner was called for each plugin (order may vary due to parallel execution).
