@@ -297,7 +297,10 @@ pub fn all_plugins() -> Vec<String> {
 
 /// Look up a plugin's category by name (built-in const + runtime overlay).
 pub fn get_plugin_metadata(name: &str) -> Option<PluginMetadata> {
-    catalog().into_iter().find(|(n, _)| n == name).map(|(_, m)| m)
+    catalog()
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, m)| m)
 }
 
 /// Look up only a *built-in* plugin's category, ignoring the overlay. Used to
@@ -354,7 +357,10 @@ pub fn registry() -> Vec<Mode> {
     let dev = |domains: &[Domain]| -> Vec<String> {
         let mut want: Vec<String> = vec!["ai-architecture".into(), "software-engineer".into()];
         want.extend(plugins_by_facets(&[Role::Engineer], domains));
-        all_plugins().into_iter().filter(|p| want.contains(p)).collect()
+        all_plugins()
+            .into_iter()
+            .filter(|p| want.contains(p))
+            .collect()
     };
 
     vec![
@@ -363,27 +369,45 @@ pub fn registry() -> Vec<Mode> {
         m("frontend", dev(&[Domain::Web])),
         m("backend", dev(&[Domain::Backend])),
         m("infra", dev(&[Domain::Infra])),
-        m("full-stack", dev(&[Domain::Web, Domain::Backend, Domain::Infra])),
+        m(
+            "full-stack",
+            dev(&[Domain::Web, Domain::Backend, Domain::Infra]),
+        ),
         // Role modes.
         m("architect", plugins_by_facets(&[Role::Architect], &[])),
-        m("product", canonical(&["ai-architecture", "software-engineer", "product"])),
+        m(
+            "product",
+            canonical(&["ai-architecture", "software-engineer", "product"]),
+        ),
         m("career", plugins_by_facets(&[Role::Career], &[])),
         m("hobby", plugins_by_facets(&[Role::Hobby], &[])),
         // Niche combinations.
         m("marketing", canonical(&["ai-architecture", "product"])),
         m("jobs", canonical(&["ai-architecture", "job-hunter"])),
         m("music", canonical(&["ai-architecture", "music-librarian"])),
-        m("home-devops", canonical(&["ai-architecture", "home-assistant", "dev-ops"])),
+        m(
+            "home-devops",
+            canonical(&["ai-architecture", "home-assistant", "dev-ops"]),
+        ),
         m("oz", canonical(&["ai-architecture", "oz"])),
-        m("realestate", canonical(&["ai-architecture", "real-estate-hunter"])),
-        m("investments-stock", canonical(&["ai-architecture", "stock-advisor"])),
+        m(
+            "realestate",
+            canonical(&["ai-architecture", "real-estate-hunter"]),
+        ),
+        m(
+            "investments-stock",
+            canonical(&["ai-architecture", "stock-advisor"]),
+        ),
         m(
             "investments-all",
             canonical(&["ai-architecture", "stock-advisor", "real-estate-hunter"]),
         ),
         // Meta modes.
         m("all", all_plugins()),
-        m("minimal", canonical(&["ai-architecture", "software-engineer"])),
+        m(
+            "minimal",
+            canonical(&["ai-architecture", "software-engineer"]),
+        ),
     ]
 }
 
@@ -523,7 +547,10 @@ mod tests {
             by_key("mobile").unwrap().plugins,
             names(&["ai-architecture", "software-engineer", "flutter", "android"])
         );
-        assert_eq!(by_key("architect").unwrap().plugins, names(&["ai-architecture"]));
+        assert_eq!(
+            by_key("architect").unwrap().plugins,
+            names(&["ai-architecture"])
+        );
     }
 
     #[test]

@@ -294,7 +294,10 @@ fn render_project(r: &DoctorReport, out: &mut String) {
     let (icon, trust) = if p.trusted {
         (OK, "trusted")
     } else {
-        (WARN, "untrusted — re-run `aip-cli mode` to trust the marker")
+        (
+            WARN,
+            "untrusted — re-run `aip-cli mode` to trust the marker",
+        )
     };
     out.push_str(&format!("  {icon} trust: {trust}\n"));
 

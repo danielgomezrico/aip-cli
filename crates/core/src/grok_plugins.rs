@@ -99,7 +99,10 @@ fn parse_line(line: &str) -> Option<GrokRegistration> {
 
 /// Count registrations of `name` in list `text`.
 fn count_registrations(text: &str, name: &str) -> usize {
-    parse_list(text).into_iter().filter(|e| e.name == name).count()
+    parse_list(text)
+        .into_iter()
+        .filter(|e| e.name == name)
+        .count()
 }
 
 /// Run the real `grok plugin list` and return its stdout (empty on any failure).
@@ -154,7 +157,8 @@ mod tests {
     use std::rc::Rc;
 
     const ENTRY: &str = "frontend-a1b2c3: frontend [local: /Users/x/.aip-cli/plugins/frontend]";
-    const DRIFTED: &str = "frontend-d4e5f6: frontend [local: /Users/x/projects/claude/plugins/frontend]";
+    const DRIFTED: &str =
+        "frontend-d4e5f6: frontend [local: /Users/x/projects/claude/plugins/frontend]";
 
     /// A `read_list` reader that yields `outputs` in order, then repeats the last
     /// one forever (so an over-eager loop keeps seeing a non-shrinking list).
@@ -175,7 +179,10 @@ mod tests {
 
     #[test]
     fn invocation_shapes() {
-        assert_eq!(list_invocation(Path::new("/c")).display(), "grok plugin list");
+        assert_eq!(
+            list_invocation(Path::new("/c")).display(),
+            "grok plugin list"
+        );
         assert_eq!(
             uninstall_invocation("frontend", Path::new("/c")).display(),
             "grok plugin uninstall frontend --confirm"

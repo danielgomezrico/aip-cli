@@ -11,10 +11,12 @@ use std::path::PathBuf;
 use aip_core::agent_state::read_state;
 use aip_core::categories;
 use aip_core::claude_plugins;
-use aip_core::grok_plugins;
-use aip_core::config::{canonicalize_dir, canonicalize_or_self, config_dir, find_repo_root, MARKER_NAME};
+use aip_core::config::{
+    canonicalize_dir, canonicalize_or_self, config_dir, find_repo_root, MARKER_NAME,
+};
 use aip_core::discovery::{discover_plugins, plugins_root};
 use aip_core::doctor::{self, AgentInput, ProjectInput, StorePlugin};
+use aip_core::grok_plugins;
 use aip_core::hook::{
     content_hash, find_marker, load_applied_hash, save_applied_hash, Marker, MarkerTarget,
     TrustStore,
@@ -162,7 +164,6 @@ fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Re
         }
     }
 
-
     // With no explicit --repo, the .aip-cli store is the canonical plugin
     // source. Gate on the *same* predicate setup uses (a discoverable plugin —
     // manifest + Makefile), so a store of manifest-only plugins falls back to
@@ -274,9 +275,7 @@ fn cmd_mode(
 fn cmd_enable(dir: PathBuf, verbose: bool) -> Result<()> {
     let here = canonicalize_dir(&dir)?;
     let marker_path = find_marker(&here).ok_or_else(|| {
-        anyhow!(
-            "no {MARKER_NAME} found above {here:?}\n  pick a mode first: aip-cli mode <name>"
-        )
+        anyhow!("no {MARKER_NAME} found above {here:?}\n  pick a mode first: aip-cli mode <name>")
     })?;
     let text = std::fs::read_to_string(&marker_path)
         .with_context(|| format!("reading {}", marker_path.display()))?;
@@ -308,8 +307,6 @@ fn cmd_enable(dir: PathBuf, verbose: bool) -> Result<()> {
     save_applied_hash(&content_hash(&text))?;
     Ok(())
 }
-
-
 
 /// Every AI agent currently installed.
 fn detect_targets() -> Vec<Target> {
@@ -538,4 +535,3 @@ fn cmd_list_modes() -> Result<()> {
     }
     Ok(())
 }
-

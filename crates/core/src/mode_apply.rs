@@ -323,14 +323,16 @@ mod tests {
         let lines = runner.lines();
         assert!(lines.iter().all(|l| l.starts_with("pi ")));
         // Enabled plugins present in store → install.
-        assert!(lines.iter().any(|l| {
-            l.starts_with("pi install ") && l.contains("ai-architecture")
-        }));
-        assert!(lines.iter().any(|l| {
-            l.starts_with("pi install ") && l.contains("software-engineer")
-        }));
+        assert!(lines
+            .iter()
+            .any(|l| { l.starts_with("pi install ") && l.contains("ai-architecture") }));
+        assert!(lines
+            .iter()
+            .any(|l| { l.starts_with("pi install ") && l.contains("software-engineer") }));
         // Off plugins → remove (even when not in store).
-        assert!(lines.iter().any(|l| l.starts_with("pi remove ") && l.contains("flutter")));
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("pi remove ") && l.contains("flutter")));
         // Wanted enables that had dirs reported success.
         let on_ok: Vec<_> = actions.iter().filter(|a| a.enable && a.success).collect();
         assert_eq!(on_ok.len(), 2);
@@ -406,10 +408,7 @@ mod tests {
 
         // Claude: n. Grok: n + preinstalls. Pi: installs for present-on + removes for off.
         let n = crate::modes::all_plugins().len();
-        assert_eq!(
-            runner.lines().len(),
-            n + n + grok_preinstalls + pi_calls
-        );
+        assert_eq!(runner.lines().len(), n + n + grok_preinstalls + pi_calls);
 
         assert!(runner
             .lines()
@@ -433,7 +432,7 @@ mod tests {
     fn is_on_path_detects_absolute_and_bare_names() {
         // Iteration 3
         assert!(is_on_path("/bin/sh")); // absolute existing
-        assert!(is_on_path("sh"));      // bare, should be on PATH on unix/mac
+        assert!(is_on_path("sh")); // bare, should be on PATH on unix/mac
         assert!(!is_on_path("/this/does/not/exist/really123"));
         assert!(!is_on_path("definitely-not-a-real-binary-xyz"));
     }
@@ -485,15 +484,21 @@ mod tests {
             .collect();
         assert_eq!(install_lines.len(), 1);
         assert!(install_lines[0].contains("ai-architecture"));
-        assert!(!install_lines.iter().any(|l| l.contains("software-engineer")));
+        assert!(!install_lines
+            .iter()
+            .any(|l| l.contains("software-engineer")));
 
         // Still performs enable/disable for *all* catalog plugins (pre-install is additive)
         let n = crate::modes::all_plugins().len();
         assert_eq!(lines.len(), n + 1); // +1 for the one install
 
         // The enable for the present one (and the other) must still be issued
-        assert!(lines.iter().any(|l| l.contains("grok plugin enable ai-architecture")));
-        assert!(lines.iter().any(|l| l.contains("grok plugin enable software-engineer")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("grok plugin enable ai-architecture")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("grok plugin enable software-engineer")));
 
         // Verify that the install invocation used the caller's cwd (not the plugin dir).
         let calls = runner.calls();
@@ -508,9 +513,7 @@ mod tests {
         // grok not liking the dir, etc.). The apply must continue and still issue
         // the enable/disable actions.
         let res = resolve("minimal").unwrap();
-        let runner = RecordingRunner::failing(|inv| {
-            inv.args.iter().any(|a| a == "install")
-        });
+        let runner = RecordingRunner::failing(|inv| inv.args.iter().any(|a| a == "install"));
         let actions = apply_mode(&res, Target::Grok, &PathBuf::from("/r"), &runner).unwrap();
 
         let n = crate::modes::all_plugins().len();

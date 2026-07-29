@@ -129,10 +129,7 @@ pub fn parse_pi(settings_json: &str) -> AgentPlugins {
     for entry in packages {
         let source = match entry {
             Value::String(s) => s.as_str(),
-            Value::Object(m) => m
-                .get("source")
-                .and_then(|s| s.as_str())
-                .unwrap_or(""),
+            Value::Object(m) => m.get("source").and_then(|s| s.as_str()).unwrap_or(""),
             _ => "",
         };
         if source.is_empty() {
@@ -286,10 +283,7 @@ disabled = ["software-engineer", "product"]
             ]
         }"#;
         let p = parse_pi(json);
-        assert_eq!(
-            p.enabled,
-            vec!["bar", "product", "software-engineer"]
-        );
+        assert_eq!(p.enabled, vec!["bar", "product", "software-engineer"]);
         assert!(p.disabled.is_empty());
     }
 
@@ -297,10 +291,7 @@ disabled = ["software-engineer", "product"]
     fn parse_pi_missing_or_malformed_is_empty() {
         assert_eq!(parse_pi("{}"), AgentPlugins::default());
         assert_eq!(parse_pi("{not json"), AgentPlugins::default());
-        assert_eq!(
-            parse_pi(r#"{"packages":[]}"#),
-            AgentPlugins::default()
-        );
+        assert_eq!(parse_pi(r#"{"packages":[]}"#), AgentPlugins::default());
     }
 
     #[test]

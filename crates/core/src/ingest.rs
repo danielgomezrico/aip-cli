@@ -192,7 +192,10 @@ mod tests {
 
         // Re-ingest with overwrite approval (the policy `setup` uses).
         ingest_folder_with(&src, &store, &mut |_| true).unwrap();
-        assert!(!dest.join("agents").exists(), "stale nested dir survived re-ingest");
+        assert!(
+            !dest.join("agents").exists(),
+            "stale nested dir survived re-ingest"
+        );
         assert!(is_plugin_dir(&dest));
     }
 
@@ -211,7 +214,10 @@ mod tests {
         fs::write(dest.join("cache").join("stale.bin"), "old").unwrap();
 
         place_clone(&co, "https://example.com/p.git", &store).unwrap();
-        assert!(!dest.join("cache").exists(), "stale nested dir survived re-clone");
+        assert!(
+            !dest.join("cache").exists(),
+            "stale nested dir survived re-clone"
+        );
         assert!(is_plugin_dir(&dest));
     }
 

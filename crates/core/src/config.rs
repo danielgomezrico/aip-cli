@@ -149,7 +149,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("nested");
         fs::create_dir_all(&dir).unwrap();
-        let messy = tmp.path().join(".").join("nested").join("..").join("nested");
+        let messy = tmp
+            .path()
+            .join(".")
+            .join("nested")
+            .join("..")
+            .join("nested");
         let got = canonicalize_dir(&messy).unwrap();
         assert!(got.is_absolute());
         assert_eq!(got, dir.canonicalize().unwrap());

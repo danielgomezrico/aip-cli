@@ -89,8 +89,7 @@ struct MarketplaceEntry {
 /// `installLocation` string; entries without one are skipped. Malformed JSON
 /// yields an empty map so callers degrade gracefully.
 pub fn parse_known_marketplaces(json: &str) -> BTreeMap<String, String> {
-    let parsed: BTreeMap<String, MarketplaceEntry> =
-        serde_json::from_str(json).unwrap_or_default();
+    let parsed: BTreeMap<String, MarketplaceEntry> = serde_json::from_str(json).unwrap_or_default();
     parsed
         .into_iter()
         .filter_map(|(name, entry)| entry.install_location.map(|loc| (name, loc)))
