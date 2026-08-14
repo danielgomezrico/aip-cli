@@ -25,11 +25,12 @@ use aip_core::ingest::{ingest_folder_with, ingest_url};
 use aip_core::manifest::PluginManifest;
 use aip_core::mode_apply::{apply_targets, available, is_on_path, Target, ALL_TARGETS};
 use aip_core::modes::{self, resolve};
+use aip_core::remove::{no_hosts_attempted, remove_from_hosts, RemoveReport, NEITHER_HOST_ERR};
 use aip_core::runner::SystemRunner;
 use aip_core::setup::{is_linked, run_setup};
 use aip_core::store;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(
     name = "aip-cli",
     version,
@@ -45,7 +46,7 @@ struct Cli {
     verbose: bool,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Command {
     /// Run prepare + install across all discovered plugins.
     ///
@@ -103,6 +104,13 @@ enum Command {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
     },
+    /// Uninstall a named plugin from Claude Code and Codex CLI.
+    ///
+    /// Does not delete the plugin from the aip-cli store.
+    Remove {
+        /// Plugin name, store directory name, or name@marketplace.
+        name: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -128,6 +136,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Doctor { dir } => cmd_doctor(dir),
+        Command::Remove { name } => cmd_remove(name, verbose),
     }
 }
 
@@ -534,4 +543,97 @@ fn cmd_list_modes() -> Result<()> {
         println!("{:>2}) {:<18} {}", i + 1, m.key, m.plugins.join(" "));
     }
     Ok(())
+}
+
+fn format_host_line(program: &str, success: bool, spec: &str) -> String {
+    format!("  {program} {} {spec}", if success { "✓" } else { "✗" })
+}
+
+fn remove_status(report: &RemoveReport) -> Result<()> {
+    if no_hosts_attempted(report) {
+        Err(anyhow!(NEITHER_HOST_ERR))
+    } else {
+        Ok(())
+    }
+}
+
+fn cmd_remove(name: String, verbose: bool) -> Result<()> {
+    let runner = SystemRunner { verbose };
+    let store_root = store::plugins_dir();
+    let cwd = cwd()?;
+    let report = remove_from_hosts(&runner, is_on_path, &name, &store_root, &cwd);
+    for a in &report.attempts {
+        println!("{}", format_host_line(a.program, a.success, &report.spec));
+    }
+    remove_status(&report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aip_core::remove::HostAttempt;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn remove_parses_name() {
+        let cli = Cli::try_parse_from(["aip-cli", "remove", "flutter"]).unwrap();
+        match cli.command {
+            Command::Remove { name } => assert_eq!(name, "flutter"),
+            _ => panic!("expected Remove"),
+        }
+    }
+
+    #[test]
+    fn remove_parses_qualified_name() {
+        let cli = Cli::try_parse_from(["aip-cli", "remove", "foo@bar"]).unwrap();
+        match cli.command {
+            Command::Remove { name } => assert_eq!(name, "foo@bar"),
+            _ => panic!("expected Remove"),
+        }
+    }
+
+    #[test]
+    fn remove_missing_name_is_clap_error() {
+        let err = Cli::try_parse_from(["aip-cli", "remove"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn remove_help_names_hosts_and_keeps_store() {
+        let err = Cli::try_parse_from(["aip-cli", "remove", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        let text = err.render().to_string();
+        assert!(text.contains("Claude"), "{text}");
+        assert!(text.contains("Codex"), "{text}");
+        assert!(text.contains("Does not delete"), "{text}");
+        assert!(text.contains("store"), "{text}");
+    }
+
+    #[test]
+    fn format_host_line_ok_and_fail() {
+        assert_eq!(format_host_line("claude", true, "a@b"), "  claude ✓ a@b");
+        assert_eq!(format_host_line("codex", false, "a@b"), "  codex ✗ a@b");
+    }
+
+    #[test]
+    fn remove_status_empty_is_err() {
+        let report = RemoveReport {
+            spec: "x".into(),
+            attempts: vec![],
+        };
+        let err = remove_status(&report).unwrap_err();
+        assert_eq!(err.to_string(), NEITHER_HOST_ERR);
+    }
+
+    #[test]
+    fn remove_status_failed_attempt_is_ok() {
+        let report = RemoveReport {
+            spec: "x".into(),
+            attempts: vec![HostAttempt {
+                program: "claude",
+                success: false,
+            }],
+        };
+        assert!(remove_status(&report).is_ok());
+    }
 }

@@ -50,6 +50,12 @@ pub fn install_invocation(plugin: &str, marketplace: &str, cwd: &Path) -> Invoca
     Invocation::new("claude", &["plugin", "install", &spec], cwd)
 }
 
+/// `claude plugin uninstall <spec>` — uninstall one plugin. `spec` is a single
+/// argv slot (do not split on `@`).
+pub fn uninstall_invocation(spec: &str, cwd: &Path) -> Invocation {
+    Invocation::new("claude", &["plugin", "uninstall", spec], cwd)
+}
+
 // ─── marketplace.json (the store plugin's own marketplace manifest) ───────────
 
 #[derive(Deserialize)]
@@ -248,6 +254,17 @@ mod tests {
         assert_eq!(
             install_invocation("flutter-pivara", "flutter-pivara", Path::new("/cwd")).display(),
             "claude plugin install flutter-pivara@flutter-pivara"
+        );
+        let inv = uninstall_invocation("flutter-pivara@flutter-pivara", Path::new("/cwd"));
+        assert_eq!(inv.program, "claude");
+        assert_eq!(
+            inv.args,
+            ["plugin", "uninstall", "flutter-pivara@flutter-pivara"]
+        );
+        assert_eq!(inv.cwd, Path::new("/cwd"));
+        assert_eq!(
+            inv.display(),
+            "claude plugin uninstall flutter-pivara@flutter-pivara"
         );
     }
 

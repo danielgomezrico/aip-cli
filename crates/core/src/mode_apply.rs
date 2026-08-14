@@ -369,6 +369,7 @@ mod tests {
         assert_eq!(Target::parse("pi"), Some(Target::Pi));
         assert_eq!(Target::parse("PI"), Some(Target::Pi));
         assert_eq!(Target::parse("gemini"), None);
+        assert_eq!(Target::parse("codex"), None);
         assert_eq!(Target::ClaudeCode.key(), "claude");
         assert_eq!(Target::Pi.key(), "pi");
         assert_eq!(Target::Pi.program(), "pi");
