@@ -296,7 +296,7 @@ mod tests {
     fn is_on_path_detects_absolute_and_bare_names() {
         // Iteration 3
         assert!(is_on_path("/bin/sh")); // absolute existing
-        assert!(is_on_path("sh"));      // bare, should be on PATH on unix/mac
+        assert!(is_on_path("sh")); // bare, should be on PATH on unix/mac
         assert!(!is_on_path("/this/does/not/exist/really123"));
         assert!(!is_on_path("definitely-not-a-real-binary-xyz"));
     }
@@ -321,33 +321,23 @@ mod tests {
 
     #[test]
     fn grok_preinstall_only_for_plugins_present_in_store() {
-        // TDD iteration 1: control the aip store via HOME to simulate partial ingest.
-        // "minimal" enables ai-architecture + software-engineer.
-        // Create dir only for one of them under a temp store.
+        // Partial ingest: only one of minimal's plugins exists in the store.
         use std::fs;
         use tempfile::TempDir;
 
-        let temp_home = TempDir::new().unwrap();
-        let store_plugins = temp_home.path().join(".aip-cli").join("plugins");
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join(".aip-cli");
+        let store_plugins = store.join("plugins");
         fs::create_dir_all(&store_plugins).unwrap();
 
-        // Only "ai-architecture" present in this fake store (simulates partial ingest).
-        let present = store_plugins.join("ai-architecture");
-        fs::create_dir_all(&present).unwrap();
-
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", temp_home.path());
+        // Only "ai-architecture" present (simulates partial ingest).
+        fs::create_dir_all(store_plugins.join("ai-architecture")).unwrap();
 
         let res = resolve("minimal").unwrap();
         let runner = RecordingRunner::new();
-        let _ = apply_mode(&res, Target::Grok, &PathBuf::from("/repo"), &runner);
-
-        // Restore
-        if let Some(h) = old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
+        store::with_store_dir(&store, || {
+            let _ = apply_mode(&res, Target::Grok, &PathBuf::from("/repo"), &runner);
+        });
 
         let lines = runner.lines();
 
@@ -358,15 +348,21 @@ mod tests {
             .collect();
         assert_eq!(install_lines.len(), 1);
         assert!(install_lines[0].contains("ai-architecture"));
-        assert!(!install_lines.iter().any(|l| l.contains("software-engineer")));
+        assert!(!install_lines
+            .iter()
+            .any(|l| l.contains("software-engineer")));
 
         // Still performs enable/disable for *all* catalog plugins (pre-install is additive)
         let n = crate::modes::all_plugins().len();
         assert_eq!(lines.len(), n + 1); // +1 for the one install
 
         // The enable for the present one (and the other) must still be issued
-        assert!(lines.iter().any(|l| l.contains("grok plugin enable ai-architecture")));
-        assert!(lines.iter().any(|l| l.contains("grok plugin enable software-engineer")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("grok plugin enable ai-architecture")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("grok plugin enable software-engineer")));
 
         // Verify that the install invocation used the caller's cwd (not the plugin dir).
         let calls = runner.calls();
@@ -381,9 +377,7 @@ mod tests {
         // grok not liking the dir, etc.). The apply must continue and still issue
         // the enable/disable actions.
         let res = resolve("minimal").unwrap();
-        let runner = RecordingRunner::failing(|inv| {
-            inv.args.iter().any(|a| a == "install")
-        });
+        let runner = RecordingRunner::failing(|inv| inv.args.iter().any(|a| a == "install"));
         let actions = apply_mode(&res, Target::Grok, &PathBuf::from("/r"), &runner).unwrap();
 
         let n = crate::modes::all_plugins().len();
