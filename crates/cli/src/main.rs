@@ -106,7 +106,9 @@ enum Command {
     },
     /// Uninstall a named plugin from Claude Code and Codex CLI.
     ///
-    /// Does not delete the plugin from the aip-cli store.
+    /// Writes a gitignored `.aip-removed` in the plugin folder so a later
+    /// `setup` will not reinstall it. Does not delete the plugin from the
+    /// aip-cli store.
     Remove {
         /// Plugin name, store directory name, or name@marketplace.
         name: String,
@@ -198,6 +200,7 @@ fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Re
     }
     let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
     let runner = SystemRunner { verbose };
+    let store_root = store::plugins_dir();
     println!("→ setup ({} plugins)", plugins.len());
     // Against a source repo we vendor + install normally (`make setup` resolves
     // its `../../scripts` tooling there). Against the store we do a link-only
@@ -206,9 +209,15 @@ fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Re
     // `make link` (always exit 0) for every plugin. Adding/vendoring a plugin is
     // the job of `setup --repo <source>`, not of a bare store refresh.
     let steps = if vendor {
-        run_setup(&plugins, &runner, |p| is_linked(&home, p), true)?
+        run_setup(
+            &plugins,
+            &runner,
+            |p| is_linked(&home, p),
+            true,
+            &store_root,
+        )?
     } else {
-        run_setup(&plugins, &runner, |_| true, false)?
+        run_setup(&plugins, &runner, |_| true, false, &store_root)?
     };
     for s in &steps {
         let icon = match s.status {
@@ -226,8 +235,10 @@ fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Re
     // manifest + marketplace names (not the store dir). Skipped for a source-repo
     // run (`vendor`): there the marketplace `add` is the plugin's own `make setup`.
     if !vendor && is_on_path("claude") {
-        let store_root = store::plugins_dir();
         for p in &plugins {
+            if aip_core::is_setup_blocked(&p.path, &store_root.join(&p.dir_name)) {
+                continue;
+            }
             let marketplace = claude_plugins::resolve_marketplace_name(&p.path, &p.dir_name);
             claude_plugins::sync_installed_plugin(
                 &runner,
@@ -247,6 +258,9 @@ fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Re
     // registration of the name first, then installs fresh from the store path.
     if is_on_path("grok") {
         for p in &plugins {
+            if aip_core::is_setup_blocked(&p.path, &store_root.join(&p.dir_name)) {
+                continue;
+            }
             grok_plugins::replace_plugin(&runner, &p.name, &p.path, &p.path, || {
                 grok_plugins::capture_list(&p.path)
             });
@@ -477,7 +491,11 @@ fn cmd_list_plugins() -> Result<()> {
         let version = PluginManifest::read(d)
             .map(|m| m.version)
             .unwrap_or_else(|_| "?".to_string());
-        println!("  {name} ({version})");
+        if aip_core::is_removed(d) {
+            println!("  {name} ({version}) [removed]");
+        } else {
+            println!("  {name} ({version})");
+        }
     }
     Ok(())
 }
@@ -565,6 +583,9 @@ fn cmd_remove(name: String, verbose: bool) -> Result<()> {
     for a in &report.attempts {
         println!("{}", format_host_line(a.program, a.success, &report.spec));
     }
+    for path in &report.marked {
+        println!("  skip {}", path.display());
+    }
     remove_status(&report)
 }
 
@@ -607,6 +628,8 @@ mod tests {
         assert!(text.contains("Codex"), "{text}");
         assert!(text.contains("Does not delete"), "{text}");
         assert!(text.contains("store"), "{text}");
+        assert!(text.contains(".aip-removed"), "{text}");
+        assert!(text.contains("setup"), "{text}");
     }
 
     #[test]
@@ -620,6 +643,7 @@ mod tests {
         let report = RemoveReport {
             spec: "x".into(),
             attempts: vec![],
+            marked: vec![],
         };
         let err = remove_status(&report).unwrap_err();
         assert_eq!(err.to_string(), NEITHER_HOST_ERR);
@@ -633,6 +657,7 @@ mod tests {
                 program: "claude",
                 success: false,
             }],
+            marked: vec![],
         };
         assert!(remove_status(&report).is_ok());
     }

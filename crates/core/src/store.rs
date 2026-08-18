@@ -7,6 +7,7 @@
 //! every AI agent on the machine.
 
 use crate::manifest::PluginManifest;
+use crate::removed::is_removed;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
@@ -187,6 +188,9 @@ pub fn install_plugin_with(
         )
     })?;
     let dest = plugins_root.join(&name);
+    if is_removed(&dest) {
+        return Ok(dest);
+    }
     if dest.exists() {
         // Replacing the same plugin is fine; a *different* plugin sharing the
         // directory name is only overwritten when `on_conflict` approves it.
@@ -394,6 +398,23 @@ mod tests {
         let meta = fs::symlink_metadata(dest.join("link.txt")).unwrap();
         assert!(meta.file_type().is_symlink());
         assert_eq!(fs::read_link(dest.join("loop")).unwrap(), Path::new(".."));
+    }
+
+    #[test]
+    fn install_plugin_does_not_replace_removed_slot() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("p");
+        make_plugin(&src, "p");
+        let store = tmp.path().join("store");
+        let dest = install_plugin(&src, &store).unwrap();
+        fs::write(dest.join(crate::removed::REMOVED_MARKER), "x").unwrap();
+        fs::write(dest.join("stale.txt"), "keep").unwrap();
+        fs::write(src.join("README.md"), "new").unwrap();
+        let again = install_plugin(&src, &store).unwrap();
+        assert_eq!(again, dest);
+        assert_eq!(fs::read_to_string(dest.join("stale.txt")).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(dest.join("README.md")).unwrap(), "hello");
+        assert!(is_removed(&dest));
     }
 
     #[test]

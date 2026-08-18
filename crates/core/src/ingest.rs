@@ -8,6 +8,7 @@
 //! The clone in [`ingest_url`] flows through a [`CommandRunner`] so the glue is
 //! testable without touching the network.
 
+use crate::removed::{is_removed, mark_removed};
 use crate::runner::{CommandRunner, Invocation};
 use crate::store::{
     install_plugin, install_plugin_with, is_plugin_dir, read_subdirs, store_name, StoreConflict,
@@ -46,6 +47,20 @@ pub fn ingest_folder_with(
     for dir in dirs {
         if !is_plugin_dir(&dir) {
             continue;
+        }
+        if is_removed(&dir) {
+            if let Some(name) = store_name(&dir) {
+                let dest = plugins_root.join(name);
+                if dest.exists() {
+                    let _ = mark_removed(&dest);
+                }
+            }
+            continue;
+        }
+        if let Some(name) = store_name(&dir) {
+            if is_removed(&plugins_root.join(name)) {
+                continue;
+            }
         }
         let dest = install_plugin_with(&dir, plugins_root, on_conflict)?;
         out.push(Ingested {
@@ -197,6 +212,61 @@ mod tests {
             "stale nested dir survived re-ingest"
         );
         assert!(is_plugin_dir(&dest));
+    }
+
+    #[test]
+    fn ingest_folder_skips_source_marked_plugin() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("incoming");
+        make_plugin(&src.join("alpha"), "alpha");
+        make_plugin(&src.join("beta"), "beta");
+        std::fs::write(src.join("alpha").join(crate::removed::REMOVED_MARKER), "").unwrap();
+        let store = tmp.path().join("store");
+
+        let ingested = ingest_folder(&src, &store).unwrap();
+        let names: Vec<&str> = ingested.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["beta"]);
+        assert!(!store.join("alpha").exists());
+        assert!(is_plugin_dir(&store.join("beta")));
+    }
+
+    #[test]
+    fn ingest_folder_skips_dest_marked_slot() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("incoming");
+        make_plugin(&src.join("alpha"), "alpha");
+        let store = tmp.path().join("store");
+        ingest_folder(&src, &store).unwrap();
+        let dest = store.join("alpha");
+        std::fs::write(dest.join(crate::removed::REMOVED_MARKER), "").unwrap();
+        std::fs::write(dest.join("stale.txt"), "keep").unwrap();
+        std::fs::write(
+            src.join("alpha").join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"alpha","version":"2.0.0"}"#,
+        )
+        .unwrap();
+
+        let ingested = ingest_folder_with(&src, &store, &mut |_| true).unwrap();
+        assert!(ingested.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dest.join("stale.txt")).unwrap(),
+            "keep"
+        );
+        assert!(crate::removed::is_removed(&dest));
+    }
+
+    #[test]
+    fn ingest_folder_source_mark_also_marks_existing_dest() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("incoming");
+        make_plugin(&src.join("alpha"), "alpha");
+        let store = tmp.path().join("store");
+        ingest_folder(&src, &store).unwrap();
+        std::fs::write(src.join("alpha").join(crate::removed::REMOVED_MARKER), "").unwrap();
+
+        let ingested = ingest_folder_with(&src, &store, &mut |_| true).unwrap();
+        assert!(ingested.is_empty());
+        assert!(crate::removed::is_removed(&store.join("alpha")));
     }
 
     #[test]

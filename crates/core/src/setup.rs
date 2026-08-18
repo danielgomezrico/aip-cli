@@ -13,6 +13,7 @@
 //!   Claude cache, otherwise `make setup`.
 
 use crate::discovery::Plugin;
+use crate::removed::is_setup_blocked;
 use crate::runner::{make, CommandRunner, Invocation};
 use std::path::{Path, PathBuf};
 
@@ -54,12 +55,17 @@ pub fn is_linked(home: &Path, plugin: &Plugin) -> bool {
         .unwrap_or(false)
 }
 
-/// Run the `prepare` phase across `plugins`. Plugins without a prepare target are
-/// recorded as skipped and no command runs for them.
-pub fn run_prepare<R: CommandRunner>(plugins: &[Plugin], runner: &R) -> std::io::Result<Vec<Step>> {
+/// Run the `prepare` phase across `plugins`. Plugins without a prepare target
+/// or with a `.aip-removed` marker (here or in `store_root`) are recorded as
+/// skipped and no command runs for them.
+pub fn run_prepare<R: CommandRunner>(
+    plugins: &[Plugin],
+    runner: &R,
+    store_root: &Path,
+) -> std::io::Result<Vec<Step>> {
     let mut steps = Vec::new();
     for p in plugins {
-        if !p.has_prepare {
+        if is_setup_blocked(&p.path, &store_root.join(&p.dir_name)) || !p.has_prepare {
             steps.push(Step {
                 plugin: p.name.clone(),
                 phase: "prepare",
@@ -82,13 +88,27 @@ pub fn run_prepare<R: CommandRunner>(plugins: &[Plugin], runner: &R) -> std::io:
 
 /// Run the `install` phase across `plugins`. `linked` decides `link` vs `setup`
 /// per plugin (inject for testing; in production pass `|p| is_linked(home, p)`).
-pub fn run_install<R, F>(plugins: &[Plugin], runner: &R, linked: F) -> std::io::Result<Vec<Step>>
+pub fn run_install<R, F>(
+    plugins: &[Plugin],
+    runner: &R,
+    linked: F,
+    store_root: &Path,
+) -> std::io::Result<Vec<Step>>
 where
     R: CommandRunner,
     F: Fn(&Plugin) -> bool,
 {
     let mut steps = Vec::new();
     for p in plugins {
+        if is_setup_blocked(&p.path, &store_root.join(&p.dir_name)) {
+            steps.push(Step {
+                plugin: p.name.clone(),
+                phase: "install",
+                status: "skip",
+                command: None,
+            });
+            continue;
+        }
         let target = install_target(linked(p));
         let inv = Invocation::new("make", &[target], &p.path);
         let out = runner.run(&inv)?;
@@ -109,18 +129,22 @@ where
 /// repo (their `../../scripts` vendoring tooling resolves), `false` when they are
 /// store copies that are already self-contained. When `false`, every plugin's
 /// prepare step is recorded as skipped and no `make prepare` runs.
+///
+/// `store_root` is the `.aip-cli` plugins dir: a `.aip-removed` marker there
+/// (or in the plugin dir itself) skips that plugin.
 pub fn run_setup<R, F>(
     plugins: &[Plugin],
     runner: &R,
     linked: F,
     vendor: bool,
+    store_root: &Path,
 ) -> std::io::Result<Vec<Step>>
 where
     R: CommandRunner,
     F: Fn(&Plugin) -> bool,
 {
     let mut steps = if vendor {
-        run_prepare(plugins, runner)?
+        run_prepare(plugins, runner, store_root)?
     } else {
         plugins
             .iter()
@@ -132,15 +156,22 @@ where
             })
             .collect()
     };
-    steps.extend(run_install(plugins, runner, linked)?);
+    steps.extend(run_install(plugins, runner, linked, store_root)?);
     Ok(steps)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::removed::{mark_removed, REMOVED_MARKER};
     use crate::runner::RecordingRunner;
+    use std::fs;
     use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn no_store() -> &'static Path {
+        Path::new("/no-such-aip-store")
+    }
 
     fn plugin(name: &str, prepare: bool) -> Plugin {
         Plugin {
@@ -170,7 +201,7 @@ mod tests {
     fn prepare_skips_plugins_without_target() {
         let plugins = vec![plugin("a", true), plugin("b", false)];
         let runner = RecordingRunner::new();
-        let steps = run_prepare(&plugins, &runner).unwrap();
+        let steps = run_prepare(&plugins, &runner, no_store()).unwrap();
         assert_eq!(steps[0].status, "ok");
         assert_eq!(steps[1].status, "skip");
         // Only "a" actually ran make prepare.
@@ -183,7 +214,7 @@ mod tests {
         let plugins = vec![plugin("a", false), plugin("b", false)];
         let runner = RecordingRunner::new();
         // "a" linked, "b" not.
-        let steps = run_install(&plugins, &runner, |p| p.name == "a").unwrap();
+        let steps = run_install(&plugins, &runner, |p| p.name == "a", no_store()).unwrap();
         assert_eq!(steps[0].command.as_deref(), Some("make link"));
         assert_eq!(steps[1].command.as_deref(), Some("make setup"));
     }
@@ -192,7 +223,7 @@ mod tests {
     fn full_setup_runs_prepare_then_install() {
         let plugins = vec![plugin("a", true)];
         let runner = RecordingRunner::new();
-        let steps = run_setup(&plugins, &runner, |_| false, true).unwrap();
+        let steps = run_setup(&plugins, &runner, |_| false, true, no_store()).unwrap();
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].phase, "prepare");
         assert_eq!(steps[1].phase, "install");
@@ -206,7 +237,7 @@ mod tests {
         // path would not resolve from the store).
         let plugins = vec![plugin("a", true)];
         let runner = RecordingRunner::new();
-        let steps = run_setup(&plugins, &runner, |_| false, false).unwrap();
+        let steps = run_setup(&plugins, &runner, |_| false, false, no_store()).unwrap();
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].phase, "prepare");
         assert_eq!(steps[0].status, "skip");
@@ -220,7 +251,44 @@ mod tests {
     fn install_marks_failure() {
         let plugins = vec![plugin("a", false)];
         let runner = RecordingRunner::failing(|_| true);
-        let steps = run_install(&plugins, &runner, |_| false).unwrap();
+        let steps = run_install(&plugins, &runner, |_| false, no_store()).unwrap();
         assert_eq!(steps[0].status, "fail");
+    }
+
+    #[test]
+    fn install_skips_plugin_dir_with_removed_marker() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("a");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join(REMOVED_MARKER), "").unwrap();
+        let plugins = vec![Plugin {
+            dir_name: "a".into(),
+            name: "a".into(),
+            version: "1.0.0".into(),
+            has_prepare: false,
+            path,
+        }];
+        let runner = RecordingRunner::new();
+        let steps = run_install(&plugins, &runner, |_| false, no_store()).unwrap();
+        assert_eq!(steps[0].status, "skip");
+        assert_eq!(steps[0].command, None);
+        assert!(runner.lines().is_empty());
+    }
+
+    #[test]
+    fn setup_skips_when_store_slot_is_marked() {
+        let store = TempDir::new().unwrap();
+        let slot = store.path().join("a");
+        fs::create_dir_all(&slot).unwrap();
+        mark_removed(&slot).unwrap();
+        let plugins = vec![plugin("a", true)];
+        let runner = RecordingRunner::new();
+        let steps = run_setup(&plugins, &runner, |_| false, true, store.path()).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].phase, "prepare");
+        assert_eq!(steps[0].status, "skip");
+        assert_eq!(steps[1].phase, "install");
+        assert_eq!(steps[1].status, "skip");
+        assert!(runner.lines().is_empty());
     }
 }

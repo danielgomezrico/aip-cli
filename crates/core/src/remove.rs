@@ -1,13 +1,18 @@
 //! Uninstall a named plugin from Claude Code and Codex CLI.
 //!
-//! Resolution and host dispatch only. Does not delete from the aip-cli store.
+//! Resolution and host dispatch, then a gitignored `.aip-removed` in each
+//! matching plugin folder so later `setup` / ingest skip it. Does not delete
+//! from the aip-cli store.
 
 use crate::claude_plugins::{resolve_marketplace_name, uninstall_invocation};
 use crate::codex_plugins::remove_invocation;
+use crate::config::find_repo_root;
+use crate::discovery::plugins_root;
 use crate::manifest::PluginManifest;
+use crate::removed::mark_removed;
 use crate::runner::CommandRunner;
 use crate::store::read_plugin_dirs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct HostAttempt {
     pub program: &'static str,
@@ -17,6 +22,8 @@ pub struct HostAttempt {
 pub struct RemoveReport {
     pub spec: String,
     pub attempts: Vec<HostAttempt>,
+    /// Marker files written so later setup skips these plugin folders.
+    pub marked: Vec<PathBuf>,
 }
 
 pub const HOSTS: [&str; 2] = ["claude", "codex"];
@@ -56,6 +63,66 @@ fn resolve_spec(name: &str, store_root: &Path) -> String {
     name.to_string()
 }
 
+fn file_name(p: &Path) -> &str {
+    p.file_name().and_then(|s| s.to_str()).unwrap_or("")
+}
+
+fn lookup_token(name: &str) -> &str {
+    name.split('@').next().unwrap_or(name)
+}
+
+/// Plugin directory under `root` matching `name` (dir name, then unique manifest).
+fn find_plugin_dir(name: &str, root: &Path) -> Option<PathBuf> {
+    let dirs = read_plugin_dirs(root);
+    if let Some(dir) = dirs.iter().find(|d| file_name(d) == name) {
+        return Some(dir.clone());
+    }
+    let token = lookup_token(name);
+    if token != name {
+        if let Some(dir) = dirs.iter().find(|d| file_name(d) == token) {
+            return Some(dir.clone());
+        }
+    }
+    let hits: Vec<_> = dirs
+        .iter()
+        .filter(|dir| {
+            PluginManifest::read(dir)
+                .ok()
+                .is_some_and(|m| m.name == token)
+        })
+        .collect();
+    if let [dir] = hits.as_slice() {
+        Some((*dir).clone())
+    } else {
+        None
+    }
+}
+
+/// Store plugin dir and, when `cwd` is inside a plugins repo, the source dir.
+pub fn resolve_plugin_dirs(name: &str, store_root: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut push = |dir: PathBuf| {
+        let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if out
+            .iter()
+            .any(|p: &PathBuf| p.canonicalize().unwrap_or_else(|_| p.clone()) == key)
+        {
+            return;
+        }
+        out.push(dir);
+    };
+    if let Some(d) = find_plugin_dir(name, store_root) {
+        push(d);
+    }
+    if let Some(repo) = find_repo_root(cwd) {
+        let root = plugins_root(&repo);
+        if let Some(d) = find_plugin_dir(name, &root) {
+            push(d);
+        }
+    }
+    out
+}
+
 pub fn remove_from_hosts<R, F>(
     runner: &R,
     exists: F,
@@ -84,7 +151,17 @@ where
         };
         attempts.push(HostAttempt { program, success });
     }
-    RemoveReport { spec, attempts }
+    let mut marked = Vec::new();
+    for dir in resolve_plugin_dirs(name, store_root, cwd) {
+        if let Ok(path) = mark_removed(&dir) {
+            marked.push(path);
+        }
+    }
+    RemoveReport {
+        spec,
+        attempts,
+        marked,
+    }
 }
 
 pub fn no_hosts_attempted(report: &RemoveReport) -> bool {
@@ -238,9 +315,82 @@ mod tests {
         );
         let plugin = store.path().join("flutter");
         let runner = RecordingRunner::new();
-        let _ = run(&runner, both_on_path, "flutter", store.path());
+        let report = run(&runner, both_on_path, "flutter", store.path());
         assert!(plugin.is_dir());
         assert!(plugin.join(".claude-plugin").join("plugin.json").is_file());
+        assert!(plugin.join(crate::removed::REMOVED_MARKER).is_file());
+        assert_eq!(
+            report.marked,
+            vec![plugin.join(crate::removed::REMOVED_MARKER)]
+        );
+    }
+
+    #[test]
+    fn marks_source_plugin_when_cwd_is_repo() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let plugins = repo.join("plugins");
+        write_store_plugin(
+            &plugins,
+            "flutter",
+            "flutter-pivara",
+            Some("flutter-pivara"),
+        );
+        let store = tmp.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let runner = RecordingRunner::new();
+        let report = remove_from_hosts(&runner, both_on_path, "flutter", &store, &repo);
+        let marker = plugins.join("flutter").join(crate::removed::REMOVED_MARKER);
+        assert!(marker.is_file());
+        assert_eq!(report.marked, vec![marker]);
+    }
+
+    #[test]
+    fn marks_store_and_source_when_both_exist() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        write_store_plugin(
+            &repo.join("plugins"),
+            "flutter",
+            "flutter-pivara",
+            Some("flutter-pivara"),
+        );
+        let store = tmp.path().join("store");
+        write_store_plugin(&store, "flutter", "flutter-pivara", Some("flutter-pivara"));
+        let runner = RecordingRunner::new();
+        let report = remove_from_hosts(&runner, both_on_path, "flutter", &store, &repo);
+        assert_eq!(report.marked.len(), 2);
+        assert!(store
+            .join("flutter")
+            .join(crate::removed::REMOVED_MARKER)
+            .is_file());
+        assert!(repo
+            .join("plugins")
+            .join("flutter")
+            .join(crate::removed::REMOVED_MARKER)
+            .is_file());
+    }
+
+    #[test]
+    fn at_token_marks_matching_dir() {
+        let store = TempDir::new().unwrap();
+        write_store_plugin(store.path(), "foo", "foo", Some("bar"));
+        let runner = RecordingRunner::new();
+        let report = run(&runner, both_on_path, "foo@bar", store.path());
+        assert!(store
+            .path()
+            .join("foo")
+            .join(crate::removed::REMOVED_MARKER)
+            .is_file());
+        assert_eq!(report.marked.len(), 1);
+    }
+
+    #[test]
+    fn missing_plugin_writes_no_marker() {
+        let store = TempDir::new().unwrap();
+        let runner = RecordingRunner::new();
+        let report = run(&runner, both_on_path, "missing", store.path());
+        assert!(report.marked.is_empty());
     }
 
     #[test]

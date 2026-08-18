@@ -20,6 +20,7 @@ pub mod manifest;
 pub mod mode_apply;
 pub mod modes;
 pub mod remove;
+pub mod removed;
 pub mod runner;
 pub mod setup;
 pub mod store;
@@ -35,4 +36,5 @@ pub use modes::{
     all_plugins, builtin_metadata, catalog, get_plugin_metadata, resolve, set_overlay, Domain,
     Mode, ModeError, PluginMetadata, Role,
 };
+pub use removed::{is_removed, is_setup_blocked, mark_removed, REMOVED_MARKER};
 pub use runner::{CommandRunner, RecordingRunner, SystemRunner};
