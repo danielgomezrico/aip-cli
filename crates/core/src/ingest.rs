@@ -8,12 +8,24 @@
 //! The clone in [`ingest_url`] flows through a [`CommandRunner`] so the glue is
 //! testable without touching the network.
 
+use crate::origins;
 use crate::removed::{is_removed, mark_removed};
 use crate::runner::{CommandRunner, Invocation};
 use crate::store::{
     install_plugin, install_plugin_with, is_plugin_dir, read_subdirs, store_name, StoreConflict,
 };
 use std::path::{Path, PathBuf};
+
+/// True for sources that should be cloned as a git repo rather than copied as a
+/// local folder.
+pub fn is_git_url(s: &str) -> bool {
+    s.starts_with("http://")
+        || s.starts_with("https://")
+        || s.starts_with("git@")
+        || s.starts_with("ssh://")
+        || s.starts_with("git://")
+        || s.ends_with(".git")
+}
 
 /// One plugin copied into the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +56,7 @@ pub fn ingest_folder_with(
     let dirs: Vec<PathBuf> = read_subdirs(folder)?;
 
     let mut out = Vec::new();
+    let mut recorded = Vec::new();
     for dir in dirs {
         if !is_plugin_dir(&dir) {
             continue;
@@ -63,12 +76,19 @@ pub fn ingest_folder_with(
             }
         }
         let dest = install_plugin_with(&dir, plugins_root, on_conflict)?;
+        let source = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        let name = store_name(&dir).unwrap_or_default();
+        recorded.push((name.clone(), source.display().to_string()));
         out.push(Ingested {
-            name: store_name(&dir).unwrap_or_default(),
-            source: dir.display().to_string(),
+            name,
+            source: source.display().to_string(),
             dest,
         });
     }
+    let last = folder
+        .canonicalize()
+        .unwrap_or_else(|_| folder.to_path_buf());
+    origins::record_many(plugins_root, Some(&last.to_string_lossy()), recorded)?;
     Ok(out)
 }
 
@@ -133,16 +153,80 @@ pub fn find_plugin(checkout: &Path) -> std::io::Result<PathBuf> {
 pub fn place_clone(checkout: &Path, url: &str, plugins_root: &Path) -> std::io::Result<Ingested> {
     let src = find_plugin(checkout)?;
     let dest = install_plugin(&src, plugins_root)?;
+    let name = store_name(&src).unwrap_or_default();
+    origins::record_many(plugins_root, Some(url), [(name.clone(), url.to_string())])?;
     Ok(Ingested {
-        name: store_name(&src).unwrap_or_default(),
+        name,
         source: url.to_string(),
         dest,
     })
 }
 
+/// Recopy `dir_name` from `source` (a local plugin dir or git URL) into
+/// `plugins_root`, overwriting the store slot. Same-path sources skip the copy.
+pub fn refresh_from_source<R: CommandRunner + ?Sized>(
+    dir_name: &str,
+    source: &str,
+    plugins_root: &Path,
+    runner: &R,
+) -> std::io::Result<Ingested> {
+    if is_git_url(source) {
+        return ingest_url(source, plugins_root, runner);
+    }
+    let src = PathBuf::from(source);
+    if !src.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("source for {dir_name} is gone: {source}"),
+        ));
+    }
+    if !is_plugin_dir(&src) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{source} is not a plugin"),
+        ));
+    }
+    let dest = plugins_root.join(dir_name);
+    let src_key = src.canonicalize().unwrap_or_else(|_| src.clone());
+    let dest_key = dest.canonicalize().unwrap_or_else(|_| dest.clone());
+    if src_key == dest_key {
+        origins::record_plugin(plugins_root, dir_name, source)?;
+        return Ok(Ingested {
+            name: dir_name.to_string(),
+            source: source.to_string(),
+            dest,
+        });
+    }
+    let dest = install_plugin_with(&src, plugins_root, &mut |_| true)?;
+    let name = store_name(&src).unwrap_or_else(|| dir_name.to_string());
+    origins::record_plugin(plugins_root, &name, source)?;
+    Ok(Ingested {
+        name,
+        source: source.to_string(),
+        dest,
+    })
+}
+
+/// Resolve `dir_name`'s last source (recorded, last folder, or cwd repo) and
+/// recopy it into the store.
+pub fn refresh_from_origin<R: CommandRunner + ?Sized>(
+    dir_name: &str,
+    plugins_root: &Path,
+    cwd: &Path,
+    runner: &R,
+) -> std::io::Result<Ingested> {
+    let source = origins::resolve_origin(dir_name, plugins_root, cwd).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no source recorded for {dir_name}; run aip-cli setup <folder> to remember it"),
+        )
+    })?;
+    refresh_from_source(dir_name, &source, plugins_root, runner)
+}
+
 /// Clone `url` into a temporary checkout and copy the plugin it contains into
 /// `plugins_root`. The clone runs through `runner`.
-pub fn ingest_url<R: CommandRunner>(
+pub fn ingest_url<R: CommandRunner + ?Sized>(
     url: &str,
     plugins_root: &Path,
     runner: &R,
@@ -398,5 +482,112 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("git clone failed"));
+    }
+
+    #[test]
+    fn is_git_url_detects_schemes_and_git_suffix() {
+        assert!(is_git_url("https://github.com/a/b"));
+        assert!(is_git_url("http://example.com/p"));
+        assert!(is_git_url("git@host:a/b.git"));
+        assert!(is_git_url("ssh://git@host/a/b"));
+        assert!(is_git_url("git://host/a/b"));
+        assert!(is_git_url("foo/bar.git"));
+        assert!(!is_git_url("/Users/x/plugins"));
+        assert!(!is_git_url("plugins"));
+    }
+
+    #[test]
+    fn ingest_folder_records_origins() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("incoming");
+        make_plugin(&src.join("alpha"), "alpha");
+        let store = tmp.path().join("store");
+        ingest_folder(&src, &store).unwrap();
+        let o = origins::load(&store);
+        let last = src.canonicalize().unwrap();
+        assert_eq!(o.last.as_deref(), Some(last.to_string_lossy().as_ref()));
+        let want = src.join("alpha").canonicalize().unwrap();
+        assert_eq!(
+            o.plugins.get("alpha").map(String::as_str),
+            Some(want.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn place_clone_records_url_origin() {
+        let tmp = TempDir::new().unwrap();
+        let co = tmp.path().join("co");
+        make_plugin(&co.join("my-plugin"), "my");
+        let store = tmp.path().join("store");
+        place_clone(&co, "https://example.com/p.git", &store).unwrap();
+        let o = origins::load(&store);
+        assert_eq!(o.last.as_deref(), Some("https://example.com/p.git"));
+        assert_eq!(
+            o.plugins.get("my-plugin").map(String::as_str),
+            Some("https://example.com/p.git")
+        );
+    }
+
+    #[test]
+    fn refresh_from_source_overwrites_store_copy() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src").join("alpha");
+        make_plugin(&src, "alpha");
+        fs::write(src.join("fresh.txt"), "new").unwrap();
+        let store = tmp.path().join("store");
+        make_plugin(&store.join("alpha"), "alpha");
+        fs::write(store.join("alpha").join("stale.txt"), "old").unwrap();
+        let runner = crate::runner::RecordingRunner::new();
+        let got = refresh_from_source("alpha", &src.to_string_lossy(), &store, &runner).unwrap();
+        assert_eq!(got.name, "alpha");
+        assert!(store.join("alpha").join("fresh.txt").is_file());
+        assert!(!store.join("alpha").join("stale.txt").exists());
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn refresh_from_source_same_path_is_noop_copy() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        make_plugin(&store.join("alpha"), "alpha");
+        fs::write(store.join("alpha").join("keep.txt"), "x").unwrap();
+        let src = store.join("alpha").canonicalize().unwrap();
+        let runner = crate::runner::RecordingRunner::new();
+        refresh_from_source("alpha", &src.to_string_lossy(), &store, &runner).unwrap();
+        assert_eq!(
+            fs::read_to_string(store.join("alpha").join("keep.txt")).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn refresh_from_source_missing_dir_errors() {
+        let tmp = TempDir::new().unwrap();
+        let runner = crate::runner::RecordingRunner::new();
+        let err = refresh_from_source("alpha", "/no/such/plugin", tmp.path(), &runner).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("gone"), "{err}");
+    }
+
+    #[test]
+    fn refresh_from_origin_uses_recorded_source() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src").join("alpha");
+        make_plugin(&src, "alpha");
+        fs::write(src.join("from-origin.txt"), "ok").unwrap();
+        let store = tmp.path().join("store");
+        make_plugin(&store.join("alpha"), "alpha");
+        origins::record_plugin(&store, "alpha", &src.to_string_lossy()).unwrap();
+        let runner = crate::runner::RecordingRunner::new();
+        refresh_from_origin("alpha", &store, tmp.path(), &runner).unwrap();
+        assert!(store.join("alpha").join("from-origin.txt").is_file());
+    }
+
+    #[test]
+    fn refresh_from_origin_without_source_errors() {
+        let tmp = TempDir::new().unwrap();
+        let runner = crate::runner::RecordingRunner::new();
+        let err = refresh_from_origin("ghost", tmp.path(), tmp.path(), &runner).unwrap_err();
+        assert!(err.to_string().contains("no source recorded"), "{err}");
     }
 }

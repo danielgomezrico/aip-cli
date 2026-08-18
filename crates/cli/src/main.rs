@@ -5,8 +5,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
 use aip_core::agent_state::read_state;
 use aip_core::categories;
@@ -21,10 +21,11 @@ use aip_core::hook::{
     content_hash, find_marker, load_applied_hash, save_applied_hash, Marker, MarkerTarget,
     TrustStore,
 };
-use aip_core::ingest::{ingest_folder_with, ingest_url};
+use aip_core::ingest::{ingest_folder_with, ingest_url, is_git_url, refresh_from_origin};
 use aip_core::manifest::PluginManifest;
 use aip_core::mode_apply::{apply_targets, available, is_on_path, Target, ALL_TARGETS};
 use aip_core::modes::{self, resolve};
+use aip_core::origins;
 use aip_core::remove::{
     expand_remove_names, list_removable, no_hosts_attempted, parse_remove_selectors,
     remove_from_hosts, RemovablePlugin, RemoveReport, RemoveSelectError, NEITHER_HOST_ERR,
@@ -37,11 +38,12 @@ use aip_core::store;
 #[command(
     name = "aip-cli",
     version,
-    about = "Install and switch Claude Code / Grok / Pi plugin modes per folder."
+    about = "Install and switch Claude Code / Grok / Pi plugin modes per folder.",
+    after_help = "Run with no command to list installed plugins and refresh selected ones from their last source."
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
     /// Print each host CLI call (`claude`/`grok` plugin enable|disable, or
     /// `pi install|remove`), its exit code, and its output — so failures are
     /// visible instead of silently tolerated.
@@ -118,6 +120,15 @@ enum Command {
         /// Omit for an interactive picker.
         names: Vec<String>,
     },
+    /// Recopy plugins from the folder/URL they were last ingested from.
+    ///
+    /// Omit names to pick from installed plugins (same as a bare `aip-cli`).
+    /// Simpler than `setup <folder>`: recopies the selected store slots and
+    /// refreshes Claude/Grok. Does not run `make prepare`.
+    Refresh {
+        /// Plugin names or 1-based picker numbers. Omit for an interactive picker.
+        names: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -127,23 +138,25 @@ fn main() -> Result<()> {
     modes::set_overlay(categories::load(&config_dir()));
     let verbose = cli.verbose;
     match cli.command {
-        Command::Setup { source, repo } => cmd_setup(repo, source, verbose),
-        Command::Mode {
+        None => cmd_refresh(Vec::new(), verbose),
+        Some(Command::Setup { source, repo }) => cmd_setup(repo, source, verbose),
+        Some(Command::Mode {
             selectors,
             only,
             dir,
             no_save,
-        } => cmd_mode(selectors, only, dir, no_save, verbose),
-        Command::Enable { dir } => cmd_enable(dir, verbose),
-        Command::List { plugins } => {
+        }) => cmd_mode(selectors, only, dir, no_save, verbose),
+        Some(Command::Enable { dir }) => cmd_enable(dir, verbose),
+        Some(Command::List { plugins }) => {
             if plugins {
                 cmd_list_plugins()
             } else {
                 cmd_list_modes()
             }
         }
-        Command::Doctor { dir } => cmd_doctor(dir),
-        Command::Remove { names } => cmd_remove(names, verbose),
+        Some(Command::Doctor { dir }) => cmd_doctor(dir),
+        Some(Command::Remove { names }) => cmd_remove(names, verbose),
+        Some(Command::Refresh { names }) => cmd_refresh(names, verbose),
     }
 }
 
@@ -163,8 +176,9 @@ fn resolve_repo(repo: Option<PathBuf>) -> Result<PathBuf> {
 
 fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Result<()> {
     // If a source is provided, ingest it first with automatic overwrite.
+    let had_source = source.is_some();
     if let Some(source) = source {
-        if looks_like_git_url(&source) {
+        if is_git_url(&source) {
             let runner = SystemRunner { verbose };
             let _ = ingest_url(&source, &store::plugins_dir(), &runner)?;
         } else {
@@ -203,6 +217,19 @@ fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Re
     if plugins.is_empty() {
         return Err(anyhow!("no plugins found under {root:?}"));
     }
+    // --repo without a SOURCE: remember each plugin's source-repo path so a
+    // later bare `aip-cli` can recopy from there. SOURCE ingest already recorded.
+    if vendor && !had_source {
+        let pairs: Vec<(String, String)> = plugins
+            .iter()
+            .map(|p| (p.dir_name.clone(), p.path.display().to_string()))
+            .collect();
+        origins::record_many(
+            &store::plugins_dir(),
+            Some(&root.display().to_string()),
+            pairs,
+        )?;
+    }
     let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
     let runner = SystemRunner { verbose };
     let store_root = store::plugins_dir();
@@ -239,37 +266,16 @@ fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Re
     // it if installed_plugins.json doesn't already list it. Keyed by the plugin's
     // manifest + marketplace names (not the store dir). Skipped for a source-repo
     // run (`vendor`): there the marketplace `add` is the plugin's own `make setup`.
-    if !vendor && is_on_path("claude") {
-        for p in &plugins {
-            if aip_core::is_setup_blocked(&p.path, &store_root.join(&p.dir_name)) {
-                continue;
-            }
-            let marketplace = claude_plugins::resolve_marketplace_name(&p.path, &p.dir_name);
-            claude_plugins::sync_installed_plugin(
-                &runner,
-                &home,
-                &store_root,
-                &p.dir_name,
-                &p.name,
-                &marketplace,
-                &p.path,
-            );
-        }
-    }
-
-    // Ensure grok serves the store's latest code for each plugin. A blind
-    // `grok plugin install` hard-fails ("repo already installed") and leaves
-    // stale/duplicate registrations, so replace_plugin uninstalls every
-    // registration of the name first, then installs fresh from the store path.
-    if is_on_path("grok") {
-        for p in &plugins {
-            if aip_core::is_setup_blocked(&p.path, &store_root.join(&p.dir_name)) {
-                continue;
-            }
-            grok_plugins::replace_plugin(&runner, &p.name, &p.path, &p.path, || {
-                grok_plugins::capture_list(&p.path)
-            });
-        }
+    for p in &plugins {
+        sync_plugin_hosts(
+            &runner,
+            &home,
+            &store_root,
+            &p.dir_name,
+            &p.name,
+            &p.path,
+            !vendor,
+        );
     }
 
     if steps.iter().any(|s| s.status == "fail") {
@@ -471,15 +477,167 @@ fn prompt_for_mode() -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-/// True for sources that should be cloned as a git repo rather than copied as a
-/// local folder.
-fn looks_like_git_url(s: &str) -> bool {
-    s.starts_with("http://")
-        || s.starts_with("https://")
-        || s.starts_with("git@")
-        || s.starts_with("ssh://")
-        || s.starts_with("git://")
-        || s.ends_with(".git")
+fn display_source(source: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy();
+        if let Some(rest) = source.strip_prefix(home.as_ref()) {
+            return format!("~{rest}");
+        }
+    }
+    source.to_string()
+}
+
+fn origin_label(dir_name: &str, store_root: &Path, cwd: &Path) -> String {
+    match origins::resolve_origin(dir_name, store_root, cwd) {
+        Some(s) => display_source(&s),
+        None => "—".to_string(),
+    }
+}
+
+fn print_plugin_rows(plugins: &[RemovablePlugin], store_root: &Path, cwd: &Path) {
+    for (i, p) in plugins.iter().enumerate() {
+        let src = origin_label(&p.dir_name, store_root, cwd);
+        if p.manifest != p.dir_name {
+            println!(
+                "  {:>2}) {:<18} ({})  {}  {}",
+                i + 1,
+                p.dir_name,
+                p.version,
+                p.manifest,
+                src
+            );
+        } else {
+            println!(
+                "  {:>2}) {:<18} ({})  {}",
+                i + 1,
+                p.dir_name,
+                p.version,
+                src
+            );
+        }
+    }
+}
+
+fn prompt_for_refresh(
+    plugins: &[RemovablePlugin],
+    store_root: &Path,
+    cwd: &Path,
+) -> Result<Vec<String>> {
+    println!("Plugins (pick one or more to refresh from last source):");
+    print_plugin_rows(plugins, store_root, cwd);
+    print!("REFRESH? (space-separated numbers or names) ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading plugin selection")?;
+    match parse_remove_selectors(line.trim(), plugins) {
+        Ok(names) => Ok(names),
+        Err(RemoveSelectError::Empty) => Ok(Vec::new()),
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+fn sync_plugin_hosts(
+    runner: &SystemRunner,
+    home: &Path,
+    store_root: &Path,
+    dir_name: &str,
+    manifest: &str,
+    path: &Path,
+    sync_claude: bool,
+) {
+    if aip_core::is_setup_blocked(path, &store_root.join(dir_name)) {
+        return;
+    }
+    if sync_claude && is_on_path("claude") {
+        let marketplace = claude_plugins::resolve_marketplace_name(path, dir_name);
+        claude_plugins::sync_installed_plugin(
+            runner,
+            home,
+            store_root,
+            dir_name,
+            manifest,
+            &marketplace,
+            path,
+        );
+    }
+    if is_on_path("grok") {
+        grok_plugins::replace_plugin(runner, manifest, path, path, || {
+            grok_plugins::capture_list(path)
+        });
+    }
+}
+
+fn cmd_refresh(names: Vec<String>, verbose: bool) -> Result<()> {
+    let store_root = store::plugins_dir();
+    let cwd = cwd()?;
+    let plugins = list_removable(&store_root);
+    if plugins.is_empty() {
+        println!("(no plugins in {})", store_root.display());
+        println!("  ingest some with: aip-cli setup <folder-or-git-url>");
+        return Ok(());
+    }
+    let names = if names.is_empty() {
+        let any_origin = plugins
+            .iter()
+            .any(|p| origins::resolve_origin(&p.dir_name, &store_root, &cwd).is_some());
+        if !any_origin {
+            println!(
+                "(no last source recorded — run `aip-cli setup <folder>` once, or run from the plugins repo)"
+            );
+        }
+        if !std::io::stdin().is_terminal() {
+            println!("plugins in {}:", store_root.display());
+            print_plugin_rows(&plugins, &store_root, &cwd);
+            println!("refresh: aip-cli refresh <name>...");
+            return Ok(());
+        }
+        let selected = prompt_for_refresh(&plugins, &store_root, &cwd)?;
+        if selected.is_empty() {
+            println!("(nothing selected)");
+            return Ok(());
+        }
+        selected
+    } else {
+        expand_remove_names(&names, &plugins)
+    };
+
+    let runner = SystemRunner { verbose };
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
+    let mut failed = false;
+    for name in &names {
+        match refresh_from_origin(name, &store_root, &cwd, &runner) {
+            Ok(ingested) => {
+                println!(
+                    "→ refresh {} ← {}",
+                    ingested.name,
+                    display_source(&ingested.source)
+                );
+                let manifest = PluginManifest::read(&ingested.dest)
+                    .map(|m| m.name)
+                    .unwrap_or_else(|_| ingested.name.clone());
+                sync_plugin_hosts(
+                    &runner,
+                    &home,
+                    &store_root,
+                    &ingested.name,
+                    &manifest,
+                    &ingested.dest,
+                    true,
+                );
+            }
+            Err(e) => {
+                println!("  ✗ {name}: {e}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        Err(anyhow!("one or more plugins failed to refresh"))
+    } else {
+        Ok(())
+    }
 }
 
 fn cmd_list_plugins() -> Result<()> {
@@ -658,7 +816,7 @@ mod tests {
     fn remove_parses_name() {
         let cli = Cli::try_parse_from(["aip-cli", "remove", "flutter"]).unwrap();
         match cli.command {
-            Command::Remove { names } => assert_eq!(names, ["flutter"]),
+            Some(Command::Remove { names }) => assert_eq!(names, ["flutter"]),
             _ => panic!("expected Remove"),
         }
     }
@@ -667,7 +825,7 @@ mod tests {
     fn remove_parses_qualified_name() {
         let cli = Cli::try_parse_from(["aip-cli", "remove", "foo@bar"]).unwrap();
         match cli.command {
-            Command::Remove { names } => assert_eq!(names, ["foo@bar"]),
+            Some(Command::Remove { names }) => assert_eq!(names, ["foo@bar"]),
             _ => panic!("expected Remove"),
         }
     }
@@ -676,7 +834,7 @@ mod tests {
     fn remove_parses_multiple_names() {
         let cli = Cli::try_parse_from(["aip-cli", "remove", "flutter", "frontend"]).unwrap();
         match cli.command {
-            Command::Remove { names } => assert_eq!(names, ["flutter", "frontend"]),
+            Some(Command::Remove { names }) => assert_eq!(names, ["flutter", "frontend"]),
             _ => panic!("expected Remove"),
         }
     }
@@ -685,9 +843,51 @@ mod tests {
     fn remove_parses_without_names() {
         let cli = Cli::try_parse_from(["aip-cli", "remove"]).unwrap();
         match cli.command {
-            Command::Remove { names } => assert!(names.is_empty()),
+            Some(Command::Remove { names }) => assert!(names.is_empty()),
             _ => panic!("expected Remove"),
         }
+    }
+
+    #[test]
+    fn no_command_parses_as_home() {
+        let cli = Cli::try_parse_from(["aip-cli"]).unwrap();
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn refresh_parses_names() {
+        let cli = Cli::try_parse_from(["aip-cli", "refresh", "frontend", "flutter"]).unwrap();
+        match cli.command {
+            Some(Command::Refresh { names }) => assert_eq!(names, ["frontend", "flutter"]),
+            _ => panic!("expected Refresh"),
+        }
+    }
+
+    #[test]
+    fn refresh_parses_without_names() {
+        let cli = Cli::try_parse_from(["aip-cli", "refresh"]).unwrap();
+        match cli.command {
+            Some(Command::Refresh { names }) => assert!(names.is_empty()),
+            _ => panic!("expected Refresh"),
+        }
+    }
+
+    #[test]
+    fn top_level_help_mentions_refresh() {
+        let err = Cli::try_parse_from(["aip-cli", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        let text = err.render().to_string();
+        assert!(text.contains("no command"), "{text}");
+        assert!(text.contains("refresh"), "{text}");
+    }
+
+    #[test]
+    fn display_source_collapses_home() {
+        let home = dirs::home_dir().expect("home");
+        let path = home.join("projects").join("claude").join("plugins");
+        let shown = display_source(&path.to_string_lossy());
+        assert_eq!(shown, "~/projects/claude/plugins");
+        assert_eq!(display_source("/tmp/x"), "/tmp/x");
     }
 
     #[test]

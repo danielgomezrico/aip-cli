@@ -19,6 +19,7 @@ pub mod ingest;
 pub mod manifest;
 pub mod mode_apply;
 pub mod modes;
+pub mod origins;
 pub mod remove;
 pub mod removed;
 pub mod runner;
