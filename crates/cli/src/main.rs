@@ -25,7 +25,10 @@ use aip_core::ingest::{ingest_folder_with, ingest_url};
 use aip_core::manifest::PluginManifest;
 use aip_core::mode_apply::{apply_targets, available, is_on_path, Target, ALL_TARGETS};
 use aip_core::modes::{self, resolve};
-use aip_core::remove::{no_hosts_attempted, remove_from_hosts, RemoveReport, NEITHER_HOST_ERR};
+use aip_core::remove::{
+    expand_remove_names, list_removable, no_hosts_attempted, parse_remove_selectors,
+    remove_from_hosts, RemovablePlugin, RemoveReport, RemoveSelectError, NEITHER_HOST_ERR,
+};
 use aip_core::runner::SystemRunner;
 use aip_core::setup::{is_linked, run_setup};
 use aip_core::store;
@@ -104,14 +107,16 @@ enum Command {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
     },
-    /// Uninstall a named plugin from Claude Code and Codex CLI.
+    /// Uninstall plugins from Claude Code and Codex CLI.
     ///
-    /// Writes a gitignored `.aip-removed` in the plugin folder so a later
-    /// `setup` will not reinstall it. Does not delete the plugin from the
-    /// aip-cli store.
+    /// Pass one or more names (store directory, manifest, or name@marketplace).
+    /// Omit names to pick from installed plugins. Writes a gitignored
+    /// `.aip-removed` in each plugin folder so a later `setup` will not
+    /// reinstall them. Does not delete plugins from the aip-cli store.
     Remove {
-        /// Plugin name, store directory name, or name@marketplace.
-        name: String,
+        /// Plugin names, store directory names, or name@marketplace.
+        /// Omit for an interactive picker.
+        names: Vec<String>,
     },
 }
 
@@ -138,7 +143,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Doctor { dir } => cmd_doctor(dir),
-        Command::Remove { name } => cmd_remove(name, verbose),
+        Command::Remove { names } => cmd_remove(names, verbose),
     }
 }
 
@@ -567,39 +572,93 @@ fn format_host_line(program: &str, success: bool, spec: &str) -> String {
     format!("  {program} {} {spec}", if success { "✓" } else { "✗" })
 }
 
-fn remove_status(report: &RemoveReport) -> Result<()> {
-    if no_hosts_attempted(report) {
-        Err(anyhow!(NEITHER_HOST_ERR))
-    } else {
+fn remove_status(any_hosts: bool) -> Result<()> {
+    if any_hosts {
         Ok(())
+    } else {
+        Err(anyhow!(NEITHER_HOST_ERR))
     }
 }
 
-fn cmd_remove(name: String, verbose: bool) -> Result<()> {
-    let runner = SystemRunner { verbose };
-    let store_root = store::plugins_dir();
-    let cwd = cwd()?;
-    let report = remove_from_hosts(&runner, is_on_path, &name, &store_root, &cwd);
+fn prompt_for_plugins(plugins: &[RemovablePlugin]) -> Result<Vec<String>> {
+    println!("Plugins (pick one or more):");
+    for (i, p) in plugins.iter().enumerate() {
+        if p.manifest != p.dir_name {
+            println!(
+                "  {:>2}) {:<18} ({})  {}",
+                i + 1,
+                p.dir_name,
+                p.version,
+                p.manifest
+            );
+        } else {
+            println!("  {:>2}) {:<18} ({})", i + 1, p.dir_name, p.version);
+        }
+    }
+    print!("REMOVE? (space-separated numbers or names) ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading plugin selection")?;
+    match parse_remove_selectors(line.trim(), plugins) {
+        Ok(names) => Ok(names),
+        Err(RemoveSelectError::Empty) => Ok(Vec::new()),
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+fn print_remove_report(report: &RemoveReport) {
+    println!("→ remove {}", report.spec);
     for a in &report.attempts {
         println!("{}", format_host_line(a.program, a.success, &report.spec));
     }
     for path in &report.marked {
         println!("  skip {}", path.display());
     }
-    remove_status(&report)
+}
+
+fn cmd_remove(names: Vec<String>, verbose: bool) -> Result<()> {
+    let runner = SystemRunner { verbose };
+    let store_root = store::plugins_dir();
+    let cwd = cwd()?;
+    let plugins = list_removable(&store_root);
+    let names = if names.is_empty() {
+        if plugins.is_empty() {
+            println!("(no plugins to remove in {})", store_root.display());
+            return Ok(());
+        }
+        let selected = prompt_for_plugins(&plugins)?;
+        if selected.is_empty() {
+            println!("(nothing selected)");
+            return Ok(());
+        }
+        selected
+    } else {
+        expand_remove_names(&names, &plugins)
+    };
+
+    let mut any_hosts = false;
+    for name in &names {
+        let report = remove_from_hosts(&runner, is_on_path, name, &store_root, &cwd);
+        print_remove_report(&report);
+        if !no_hosts_attempted(&report) {
+            any_hosts = true;
+        }
+    }
+    remove_status(any_hosts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aip_core::remove::HostAttempt;
     use clap::error::ErrorKind;
 
     #[test]
     fn remove_parses_name() {
         let cli = Cli::try_parse_from(["aip-cli", "remove", "flutter"]).unwrap();
         match cli.command {
-            Command::Remove { name } => assert_eq!(name, "flutter"),
+            Command::Remove { names } => assert_eq!(names, ["flutter"]),
             _ => panic!("expected Remove"),
         }
     }
@@ -608,15 +667,27 @@ mod tests {
     fn remove_parses_qualified_name() {
         let cli = Cli::try_parse_from(["aip-cli", "remove", "foo@bar"]).unwrap();
         match cli.command {
-            Command::Remove { name } => assert_eq!(name, "foo@bar"),
+            Command::Remove { names } => assert_eq!(names, ["foo@bar"]),
             _ => panic!("expected Remove"),
         }
     }
 
     #[test]
-    fn remove_missing_name_is_clap_error() {
-        let err = Cli::try_parse_from(["aip-cli", "remove"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    fn remove_parses_multiple_names() {
+        let cli = Cli::try_parse_from(["aip-cli", "remove", "flutter", "frontend"]).unwrap();
+        match cli.command {
+            Command::Remove { names } => assert_eq!(names, ["flutter", "frontend"]),
+            _ => panic!("expected Remove"),
+        }
+    }
+
+    #[test]
+    fn remove_parses_without_names() {
+        let cli = Cli::try_parse_from(["aip-cli", "remove"]).unwrap();
+        match cli.command {
+            Command::Remove { names } => assert!(names.is_empty()),
+            _ => panic!("expected Remove"),
+        }
     }
 
     #[test]
@@ -630,6 +701,10 @@ mod tests {
         assert!(text.contains("store"), "{text}");
         assert!(text.contains(".aip-removed"), "{text}");
         assert!(text.contains("setup"), "{text}");
+        assert!(
+            text.contains("Omit") || text.contains("interactive"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -640,25 +715,12 @@ mod tests {
 
     #[test]
     fn remove_status_empty_is_err() {
-        let report = RemoveReport {
-            spec: "x".into(),
-            attempts: vec![],
-            marked: vec![],
-        };
-        let err = remove_status(&report).unwrap_err();
+        let err = remove_status(false).unwrap_err();
         assert_eq!(err.to_string(), NEITHER_HOST_ERR);
     }
 
     #[test]
     fn remove_status_failed_attempt_is_ok() {
-        let report = RemoveReport {
-            spec: "x".into(),
-            attempts: vec![HostAttempt {
-                program: "claude",
-                success: false,
-            }],
-            marked: vec![],
-        };
-        assert!(remove_status(&report).is_ok());
+        assert!(remove_status(true).is_ok());
     }
 }

@@ -9,10 +9,11 @@ use crate::codex_plugins::remove_invocation;
 use crate::config::find_repo_root;
 use crate::discovery::plugins_root;
 use crate::manifest::PluginManifest;
-use crate::removed::mark_removed;
+use crate::removed::{is_removed, mark_removed};
 use crate::runner::CommandRunner;
 use crate::store::read_plugin_dirs;
 use std::path::{Path, PathBuf};
+use thiserror::Error;
 
 pub struct HostAttempt {
     pub program: &'static str,
@@ -28,6 +29,25 @@ pub struct RemoveReport {
 
 pub const HOSTS: [&str; 2] = ["claude", "codex"];
 pub const NEITHER_HOST_ERR: &str = "neither claude nor codex found on PATH";
+
+/// A store plugin the interactive `remove` picker can offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovablePlugin {
+    /// Store directory name — what [`remove_from_hosts`] resolves first.
+    pub dir_name: String,
+    /// Manifest `name` (falls back to [`Self::dir_name`] when unreadable).
+    pub manifest: String,
+    pub version: String,
+}
+
+/// Errors from resolving a `remove` picker selection.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RemoveSelectError {
+    #[error("unknown plugin: {0}")]
+    Unknown(String),
+    #[error("no plugins selected")]
+    Empty,
+}
 
 /// Resolve `name` to the spec both hosts receive. `@` is pass-through; otherwise
 /// store dir-name wins, then a unique readable manifest name, else the raw token.
@@ -118,6 +138,94 @@ pub fn resolve_plugin_dirs(name: &str, store_root: &Path, cwd: &Path) -> Vec<Pat
         let root = plugins_root(&repo);
         if let Some(d) = find_plugin_dir(name, &root) {
             push(d);
+        }
+    }
+    out
+}
+
+/// Store plugins that are not already marked removed, in directory-name order.
+pub fn list_removable(store_root: &Path) -> Vec<RemovablePlugin> {
+    read_plugin_dirs(store_root)
+        .into_iter()
+        .filter(|dir| !is_removed(dir))
+        .filter_map(|dir| {
+            let dir_name = file_name(&dir);
+            if dir_name.is_empty() {
+                return None;
+            }
+            let (manifest, version) = match PluginManifest::read(&dir) {
+                Ok(m) => (m.name, m.version),
+                Err(_) => (dir_name.to_string(), "?".to_string()),
+            };
+            Some(RemovablePlugin {
+                dir_name: dir_name.to_string(),
+                manifest,
+                version,
+            })
+        })
+        .collect()
+}
+
+fn split_selector_tokens(input: &str) -> Vec<&str> {
+    input
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+fn resolve_select_token(
+    token: &str,
+    plugins: &[RemovablePlugin],
+) -> Result<String, RemoveSelectError> {
+    if !token.is_empty() && token.chars().all(|c| c.is_ascii_digit()) {
+        let idx: usize = token
+            .parse()
+            .map_err(|_| RemoveSelectError::Unknown(token.to_string()))?;
+        return plugins
+            .get(idx.wrapping_sub(1))
+            .filter(|_| idx >= 1)
+            .map(|p| p.dir_name.clone())
+            .ok_or_else(|| RemoveSelectError::Unknown(token.to_string()));
+    }
+    if let Some(p) = plugins.iter().find(|p| p.dir_name == token) {
+        return Ok(p.dir_name.clone());
+    }
+    let hits: Vec<_> = plugins.iter().filter(|p| p.manifest == token).collect();
+    if let [p] = hits.as_slice() {
+        return Ok(p.dir_name.clone());
+    }
+    Err(RemoveSelectError::Unknown(token.to_string()))
+}
+
+/// Resolve a picker line (names or 1-based numbers, comma/space-separated)
+/// to store directory names. Unknown tokens error.
+pub fn parse_remove_selectors(
+    input: &str,
+    plugins: &[RemovablePlugin],
+) -> Result<Vec<String>, RemoveSelectError> {
+    let tokens = split_selector_tokens(input);
+    if tokens.is_empty() {
+        return Err(RemoveSelectError::Empty);
+    }
+    let mut chosen = Vec::new();
+    for tok in tokens {
+        let name = resolve_select_token(tok, plugins)?;
+        if !chosen.iter().any(|c| c == &name) {
+            chosen.push(name);
+        }
+    }
+    Ok(chosen)
+}
+
+/// Resolve CLI name tokens against the removable list. Known dir names,
+/// unique manifest names, and 1-based indices expand; anything else is kept
+/// as-is so `name@marketplace` and host-only plugins still work.
+pub fn expand_remove_names(names: &[String], plugins: &[RemovablePlugin]) -> Vec<String> {
+    let mut out = Vec::new();
+    for n in names {
+        let resolved = resolve_select_token(n, plugins).unwrap_or_else(|_| n.clone());
+        if !out.iter().any(|c| c == &resolved) {
+            out.push(resolved);
         }
     }
     out
@@ -535,5 +643,142 @@ mod tests {
         assert_eq!(HOSTS, ["claude", "codex"]);
         assert!(!HOSTS.contains(&"grok"));
         assert!(!HOSTS.contains(&"pi"));
+    }
+
+    #[test]
+    fn list_removable_empty_store() {
+        let store = TempDir::new().unwrap();
+        assert!(list_removable(store.path()).is_empty());
+    }
+
+    #[test]
+    fn list_removable_skips_marked_and_keeps_order() {
+        let store = TempDir::new().unwrap();
+        write_store_plugin(store.path(), "alpha", "alpha", None);
+        write_store_plugin(store.path(), "beta", "beta-plugin", None);
+        write_store_plugin(store.path(), "gamma", "gamma", None);
+        mark_removed(&store.path().join("beta")).unwrap();
+        let listed = list_removable(store.path());
+        assert_eq!(
+            listed
+                .iter()
+                .map(|p| (p.dir_name.as_str(), p.manifest.as_str(), p.version.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("alpha", "alpha", "1.0.0"), ("gamma", "gamma", "1.0.0")]
+        );
+    }
+
+    #[test]
+    fn list_removable_unreadable_manifest_uses_dir_name() {
+        let store = TempDir::new().unwrap();
+        let meta = store.path().join("foo").join(".claude-plugin");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(meta.join("plugin.json"), "not-json").unwrap();
+        let listed = list_removable(store.path());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].dir_name, "foo");
+        assert_eq!(listed[0].manifest, "foo");
+        assert_eq!(listed[0].version, "?");
+    }
+
+    fn sample_plugins() -> Vec<RemovablePlugin> {
+        vec![
+            RemovablePlugin {
+                dir_name: "flutter".into(),
+                manifest: "flutter-pivara".into(),
+                version: "1.0.0".into(),
+            },
+            RemovablePlugin {
+                dir_name: "frontend".into(),
+                manifest: "frontend".into(),
+                version: "2.0.0".into(),
+            },
+            RemovablePlugin {
+                dir_name: "a".into(),
+                manifest: "shared".into(),
+                version: "1.0.0".into(),
+            },
+            RemovablePlugin {
+                dir_name: "b".into(),
+                manifest: "shared".into(),
+                version: "1.0.0".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn parse_selectors_by_index_and_name() {
+        let plugins = sample_plugins();
+        assert_eq!(
+            parse_remove_selectors("1", &plugins).unwrap(),
+            vec!["flutter"]
+        );
+        assert_eq!(
+            parse_remove_selectors("2 1", &plugins).unwrap(),
+            vec!["frontend", "flutter"]
+        );
+        assert_eq!(
+            parse_remove_selectors("1,2", &plugins).unwrap(),
+            vec!["flutter", "frontend"]
+        );
+        assert_eq!(
+            parse_remove_selectors("frontend", &plugins).unwrap(),
+            vec!["frontend"]
+        );
+        assert_eq!(
+            parse_remove_selectors("flutter-pivara", &plugins).unwrap(),
+            vec!["flutter"]
+        );
+    }
+
+    #[test]
+    fn parse_selectors_dedups_and_rejects() {
+        let plugins = sample_plugins();
+        assert_eq!(
+            parse_remove_selectors("1 1 frontend", &plugins).unwrap(),
+            vec!["flutter", "frontend"]
+        );
+        assert_eq!(
+            parse_remove_selectors("", &plugins).unwrap_err(),
+            RemoveSelectError::Empty
+        );
+        assert_eq!(
+            parse_remove_selectors("   ", &plugins).unwrap_err(),
+            RemoveSelectError::Empty
+        );
+        assert_eq!(
+            parse_remove_selectors("0", &plugins).unwrap_err(),
+            RemoveSelectError::Unknown("0".into())
+        );
+        assert_eq!(
+            parse_remove_selectors("99", &plugins).unwrap_err(),
+            RemoveSelectError::Unknown("99".into())
+        );
+        assert_eq!(
+            parse_remove_selectors("missing", &plugins).unwrap_err(),
+            RemoveSelectError::Unknown("missing".into())
+        );
+        assert_eq!(
+            parse_remove_selectors("shared", &plugins).unwrap_err(),
+            RemoveSelectError::Unknown("shared".into())
+        );
+    }
+
+    #[test]
+    fn expand_names_resolves_known_and_passthrough_unknown() {
+        let plugins = sample_plugins();
+        assert_eq!(
+            expand_remove_names(
+                &[
+                    "1".into(),
+                    "flutter-pivara".into(),
+                    "missing".into(),
+                    "foo@bar".into(),
+                    "1".into(),
+                ],
+                &plugins
+            ),
+            vec!["flutter", "missing", "foo@bar"]
+        );
     }
 }
