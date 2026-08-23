@@ -32,7 +32,7 @@ use aip_core::remove::{
     NEITHER_HOST_ERR,
 };
 use aip_core::runner::SystemRunner;
-use aip_core::setup::{is_linked, run_setup};
+use aip_core::setup::{install_pi_packages, is_linked, run_setup};
 use aip_core::store;
 
 #[derive(Parser, Debug)]
@@ -277,6 +277,21 @@ fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Re
             &p.name,
             &p.path,
             !vendor,
+        );
+    }
+
+    // Register store/source plugins with pi (package install → settings packages[]).
+    // Pi has no `plugin enable|disable`; install is setup-only. Failures count + print;
+    // they do not fail setup (Grok parity).
+    if is_on_path("pi") {
+        println!("→ pi install ({} plugins)", plugins.len());
+        println!(
+            "  note: pi has no plugin disable; all installed package skills load globally until removed"
+        );
+        let report = install_pi_packages(&plugins, &runner);
+        println!(
+            "  pi: {} ok, {} failed, {} skipped",
+            report.ok, report.failed, report.skipped
         );
     }
 
