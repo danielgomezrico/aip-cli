@@ -30,7 +30,7 @@ pub struct RemoveReport {
 pub const HOSTS: [&str; 2] = ["claude", "codex"];
 pub const NEITHER_HOST_ERR: &str = "neither claude nor codex found on PATH";
 
-/// A store plugin the interactive `remove` picker can offer.
+/// A plugin the interactive `remove` picker can offer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovablePlugin {
     /// Store directory name — what [`remove_from_hosts`] resolves first.
@@ -164,6 +164,88 @@ pub fn list_removable(store_root: &Path) -> Vec<RemovablePlugin> {
             })
         })
         .collect()
+}
+
+/// Store ∪ extra-root plugins with at least one unmarked copy, deduped by
+/// directory name. Manifest/version prefer the store copy, else the extra-root
+/// copy. Sorted by directory name, same as [`read_plugin_dirs`].
+pub fn list_removable_union<P: AsRef<Path>>(
+    store_root: &Path,
+    extra_roots: &[P],
+) -> Vec<RemovablePlugin> {
+    struct Hit {
+        prefer: PathBuf,
+        any_unmarked: bool,
+    }
+    let mut hits: std::collections::BTreeMap<String, Hit> = std::collections::BTreeMap::new();
+    for dir in read_plugin_dirs(store_root) {
+        let dir_name = file_name(&dir);
+        if dir_name.is_empty() {
+            continue;
+        }
+        let unmarked = !is_removed(&dir);
+        hits.insert(
+            dir_name.to_string(),
+            Hit {
+                prefer: dir,
+                any_unmarked: unmarked,
+            },
+        );
+    }
+    for root in extra_roots {
+        for dir in read_plugin_dirs(root.as_ref()) {
+            let dir_name = file_name(&dir);
+            if dir_name.is_empty() {
+                continue;
+            }
+            let unmarked = !is_removed(&dir);
+            match hits.get_mut(dir_name) {
+                Some(hit) => hit.any_unmarked |= unmarked,
+                None => {
+                    hits.insert(
+                        dir_name.to_string(),
+                        Hit {
+                            prefer: dir,
+                            any_unmarked: unmarked,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    hits.into_iter()
+        .filter(|(_, h)| h.any_unmarked)
+        .map(|(dir_name, h)| {
+            let (manifest, version) = match PluginManifest::read(&h.prefer) {
+                Ok(m) => (m.name, m.version),
+                Err(_) => (dir_name.clone(), "?".to_string()),
+            };
+            RemovablePlugin {
+                dir_name,
+                manifest,
+                version,
+            }
+        })
+        .collect()
+}
+
+/// Extra roots for the interactive remove picker: cwd `plugins/` and local
+/// `origins.last` (git URLs and other non-directories are dropped).
+fn remove_picker_extra_roots(store_root: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let mut extra = Vec::new();
+    if let Some(repo) = find_repo_root(cwd) {
+        extra.push(plugins_root(&repo));
+    }
+    if let Some(last) = crate::origins::load(store_root).last {
+        extra.push(PathBuf::from(last));
+    }
+    extra.retain(|p| p.is_dir());
+    extra
+}
+
+/// Plugins the interactive `remove` picker may offer (store ∪ extra roots).
+pub fn list_removable_for_remove(store_root: &Path, cwd: &Path) -> Vec<RemovablePlugin> {
+    list_removable_union(store_root, &remove_picker_extra_roots(store_root, cwd))
 }
 
 fn split_selector_tokens(input: &str) -> Vec<&str> {
@@ -679,6 +761,99 @@ mod tests {
         assert_eq!(listed[0].dir_name, "foo");
         assert_eq!(listed[0].manifest, "foo");
         assert_eq!(listed[0].version, "?");
+    }
+
+    fn listed_dir_names(listed: &[RemovablePlugin]) -> Vec<&str> {
+        listed.iter().map(|p| p.dir_name.as_str()).collect()
+    }
+
+    #[test]
+    fn list_removable_union_source_only_when_store_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let extra = tmp.path().join("src");
+        write_store_plugin(&extra, "job-hunter", "job-hunter", None);
+        let listed = list_removable_union(&store, &[extra.as_path()]);
+        assert_eq!(listed_dir_names(&listed), vec!["job-hunter"]);
+        assert!(list_removable(&store).is_empty());
+    }
+
+    #[test]
+    fn list_removable_union_dedups_same_dir_name() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let extra = tmp.path().join("src");
+        write_store_plugin(&store, "job-hunter", "store-name", None);
+        write_store_plugin(&extra, "job-hunter", "source-name", None);
+        let listed = list_removable_union(&store, &[extra.as_path()]);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].dir_name, "job-hunter");
+        assert_eq!(listed[0].manifest, "store-name");
+    }
+
+    #[test]
+    fn list_removable_union_includes_store_marked_source_unmarked() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let extra = tmp.path().join("src");
+        write_store_plugin(&store, "job-hunter", "job-hunter", None);
+        write_store_plugin(&extra, "job-hunter", "job-hunter", None);
+        mark_removed(&store.join("job-hunter")).unwrap();
+        assert!(crate::removed::is_setup_blocked(
+            &extra.join("job-hunter"),
+            &store.join("job-hunter")
+        ));
+        let listed = list_removable_union(&store, &[extra.as_path()]);
+        assert_eq!(listed_dir_names(&listed), vec!["job-hunter"]);
+        assert!(list_removable(&store).is_empty());
+    }
+
+    #[test]
+    fn list_removable_union_omits_when_all_known_copies_marked() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let extra = tmp.path().join("src");
+        write_store_plugin(&extra, "job-hunter", "job-hunter", None);
+        mark_removed(&extra.join("job-hunter")).unwrap();
+        assert!(list_removable_union(&store, &[extra.as_path()]).is_empty());
+
+        write_store_plugin(&store, "job-hunter", "job-hunter", None);
+        mark_removed(&store.join("job-hunter")).unwrap();
+        assert!(list_removable_union(&store, &[extra.as_path()]).is_empty());
+        assert!(list_removable(&store).is_empty());
+    }
+
+    #[test]
+    fn list_removable_union_includes_store_unmarked_when_source_marked() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        let extra = tmp.path().join("src");
+        write_store_plugin(&store, "alpha", "alpha", None);
+        write_store_plugin(&extra, "alpha", "alpha", None);
+        mark_removed(&extra.join("alpha")).unwrap();
+        let listed = list_removable_union(&store, &[extra.as_path()]);
+        assert_eq!(listed_dir_names(&listed), vec!["alpha"]);
+    }
+
+    #[test]
+    fn list_removable_for_remove_uses_cwd_plugins_and_local_last() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let repo = tmp.path().join("repo");
+        write_store_plugin(&repo.join("plugins"), "job-hunter", "job-hunter", None);
+        crate::origins::record_last(&store, "https://example.com/plugins.git").unwrap();
+        let listed = list_removable_for_remove(&store, &repo);
+        assert_eq!(listed_dir_names(&listed), vec!["job-hunter"]);
+
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let last = tmp.path().join("last-src");
+        write_store_plugin(&last, "stock-advisor", "stock-advisor", None);
+        crate::origins::record_last(&store, &last.to_string_lossy()).unwrap();
+        let listed = list_removable_for_remove(&store, &elsewhere);
+        assert_eq!(listed_dir_names(&listed), vec!["stock-advisor"]);
     }
 
     fn sample_plugins() -> Vec<RemovablePlugin> {

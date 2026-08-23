@@ -5,7 +5,7 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// File name written into a plugin directory to skip later setup.
 pub const REMOVED_MARKER: &str = ".aip-removed";
@@ -49,7 +49,8 @@ fn git_cmd(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .current_dir(dir);
+        .current_dir(dir)
+        .stderr(Stdio::null());
     cmd
 }
 
@@ -195,6 +196,21 @@ mod tests {
         mark_removed(tmp.path()).unwrap();
         assert!(is_removed(tmp.path()));
         assert_eq!(git_check_ignore(tmp.path(), REMOVED_MARKER), None);
+    }
+
+    #[test]
+    fn git_cmd_discards_stderr_on_non_repo() {
+        let tmp = TempDir::new().unwrap();
+        let out = git_cmd(tmp.path())
+            .args(["check-ignore", "-q", "--", REMOVED_MARKER])
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.stderr.is_empty(),
+            "git stderr should be discarded, got {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(git_is_ignored(tmp.path(), REMOVED_MARKER), None);
     }
 
     #[test]

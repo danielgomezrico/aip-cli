@@ -27,8 +27,9 @@ use aip_core::mode_apply::{apply_targets, available, is_on_path, Target, ALL_TAR
 use aip_core::modes::{self, resolve};
 use aip_core::origins;
 use aip_core::remove::{
-    expand_remove_names, list_removable, no_hosts_attempted, parse_remove_selectors,
-    remove_from_hosts, RemovablePlugin, RemoveReport, RemoveSelectError, NEITHER_HOST_ERR,
+    expand_remove_names, list_removable, list_removable_for_remove, no_hosts_attempted,
+    parse_remove_selectors, remove_from_hosts, RemovablePlugin, RemoveReport, RemoveSelectError,
+    NEITHER_HOST_ERR,
 };
 use aip_core::runner::SystemRunner;
 use aip_core::setup::{is_linked, run_setup};
@@ -112,9 +113,10 @@ enum Command {
     /// Uninstall plugins from Claude Code and Codex CLI.
     ///
     /// Pass one or more names (store directory, manifest, or name@marketplace).
-    /// Omit names to pick from installed plugins. Writes a gitignored
-    /// `.aip-removed` in each plugin folder so a later `setup` will not
-    /// reinstall them. Does not delete plugins from the aip-cli store.
+    /// Omit names to pick plugins to mark `.aip-removed` (store and, when
+    /// present, source). Writes a gitignored `.aip-removed` in each plugin
+    /// folder so a later `setup` will not reinstall them. Does not delete
+    /// plugins from the aip-cli store.
     Remove {
         /// Plugin names, store directory names, or name@marketplace.
         /// Omit for an interactive picker.
@@ -780,7 +782,7 @@ fn cmd_remove(names: Vec<String>, verbose: bool) -> Result<()> {
     let runner = SystemRunner { verbose };
     let store_root = store::plugins_dir();
     let cwd = cwd()?;
-    let plugins = list_removable(&store_root);
+    let plugins = list_removable_for_remove(&store_root, &cwd);
     let names = if names.is_empty() {
         if plugins.is_empty() {
             println!("(no plugins to remove in {})", store_root.display());
