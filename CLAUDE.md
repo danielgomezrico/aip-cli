@@ -1,6 +1,6 @@
 # aip-cli
 
-Rust CLI: install and switch Claude / Grok / Pi plugin modes per folder.
+Rust CLI: install and switch Claude / Grok / Pi plugins per folder.
 
 ## `.aip-removed`
 

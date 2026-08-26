@@ -1,4 +1,4 @@
-# Copy to `.aip-cli.toml` in a repo to auto-activate a mode on `cd`.
+# Copy to `.aip-cli.toml` in a repo. Enable is manual — run `aip-cli enable`.
 # Then trust it once:  aip-cli allow
-mode = "mobile"
+mode = "apple backend-go"
 # target = "grok"   # optional: pin to ONE agent. Omit to apply to ALL installed agents.

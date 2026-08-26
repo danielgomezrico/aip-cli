@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aip-cli: install and switch Claude Code / Grok plugin modes per folder (manual enable)."
+description = "aip-cli: install and switch Claude Code / Grok plugins per folder (manual enable)."
 
 [[bin]]
 name = "aip-cli"

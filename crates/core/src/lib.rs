@@ -7,7 +7,6 @@
 
 pub mod agent_state;
 pub mod arg_enum;
-pub mod categories;
 pub mod claude_plugins;
 pub mod codex_plugins;
 pub mod config;
@@ -33,9 +32,6 @@ pub use doctor::{build_report, render as render_doctor, DoctorReport};
 pub use ingest::{ingest_folder, ingest_url, Ingested};
 pub use manifest::PluginManifest;
 pub use mode_apply::{apply_mode, Target};
-pub use modes::{
-    all_plugins, builtin_metadata, catalog, get_plugin_metadata, resolve, set_overlay, Domain,
-    Mode, ModeError, PluginMetadata, Role,
-};
+pub use modes::{all_plugins, resolve, ModeError};
 pub use removed::{is_removed, is_setup_blocked, mark_removed, REMOVED_MARKER};
 pub use runner::{CommandRunner, RecordingRunner, SystemRunner};

@@ -1,4 +1,4 @@
-//! `aip-cli` — install and switch Claude Code / Grok plugin modes.
+//! `aip-cli` — install and switch Claude Code / Grok plugins.
 //!
 //! This binary is intentionally thin: argument parsing and I/O only. All logic
 //! lives in `aip_core` so it can be unit-tested without side effects.
@@ -9,11 +9,8 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use aip_core::agent_state::read_state;
-use aip_core::categories;
 use aip_core::claude_plugins;
-use aip_core::config::{
-    canonicalize_dir, canonicalize_or_self, config_dir, find_repo_root, MARKER_NAME,
-};
+use aip_core::config::{canonicalize_dir, canonicalize_or_self, find_repo_root, MARKER_NAME};
 use aip_core::discovery::{discover_plugins, plugins_root};
 use aip_core::doctor::{self, AgentInput, ProjectInput, StorePlugin};
 use aip_core::grok_plugins;
@@ -39,7 +36,7 @@ use aip_core::store;
 #[command(
     name = "aip-cli",
     version,
-    about = "Install and switch Claude Code / Grok / Pi plugin modes per folder.",
+    about = "Install and switch Claude Code / Grok / Pi plugins per folder.",
     after_help = "Run with no command to list installed plugins and refresh selected ones from their last source."
 )]
 struct Cli {
@@ -66,13 +63,14 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Pick a mode, apply it now, and remember it for this folder.
+    /// Pick plugins by name or 1-based number, apply them now, and remember
+    /// the selection for this folder.
     ///
-    /// Applies the mode to every installed AI agent, then writes a
+    /// Applies the selected plugins to every installed AI agent, then writes a
     /// `.aip-cli.toml` marker so you can re-apply later with `aip-cli enable`.
     /// Pass `--no-save` for a one-off apply that writes no marker.
     Mode {
-        /// Mode selectors (names or 1-based numbers). Omit for an interactive picker.
+        /// Plugin selectors (names or 1-based numbers). Omit for an interactive picker.
         selectors: Vec<String>,
         /// Restrict to a single agent (`claude`, `grok`, or `pi`) and pin the
         /// marker to it. Default: all installed agents.
@@ -94,9 +92,9 @@ enum Command {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
     },
-    /// List the available modes, or the store's plugins with `--plugins`.
+    /// List numbered selectable plugins, or the store inventory with `--plugins`.
     List {
-        /// List the plugins held in the .aip-cli store instead of the modes.
+        /// List the plugins held in the .aip-cli store (versions and [removed]).
         #[arg(long)]
         plugins: bool,
     },
@@ -135,9 +133,6 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    // Merge persisted categories for ingested plugins over the built-in catalog,
-    // so they participate in modes/doctor just like built-ins.
-    modes::set_overlay(categories::load(&config_dir()));
     let verbose = cli.verbose;
     match cli.command {
         None => cmd_refresh(Vec::new(), verbose),
@@ -481,11 +476,11 @@ fn persist_marker(selector: &str, only: Option<String>, dir: PathBuf) -> Result<
 }
 
 fn prompt_for_mode() -> Result<String> {
-    println!("Modes (pick one or more):");
-    for (i, m) in modes::registry().iter().enumerate() {
-        println!("  {:>2}) {:<18} ({})", i + 1, m.key, m.plugins.join(" "));
+    println!("Plugins (pick one or more):");
+    for line in modes::numbered_plugin_lines() {
+        println!("  {line}");
     }
-    print!("MODE? (space-separated numbers or names) ");
+    print!("PLUGINS? (space-separated numbers or names) ");
     std::io::stdout().flush().ok();
     let mut line = String::new();
     std::io::stdin()
@@ -737,8 +732,8 @@ fn cmd_doctor(dir: PathBuf) -> Result<()> {
 }
 
 fn cmd_list_modes() -> Result<()> {
-    for (i, m) in modes::registry().iter().enumerate() {
-        println!("{:>2}) {:<18} {}", i + 1, m.key, m.plugins.join(" "));
+    for line in modes::numbered_plugin_lines() {
+        println!("{line}");
     }
     Ok(())
 }
@@ -896,6 +891,37 @@ mod tests {
         let text = err.render().to_string();
         assert!(text.contains("no command"), "{text}");
         assert!(text.contains("refresh"), "{text}");
+    }
+
+    #[test]
+    fn mode_parses_plugin_selectors() {
+        let cli = Cli::try_parse_from(["aip-cli", "mode", "apple", "backend-go"]).unwrap();
+        match cli.command {
+            Some(Command::Mode { selectors, .. }) => {
+                assert_eq!(selectors, ["apple", "backend-go"]);
+            }
+            _ => panic!("expected Mode"),
+        }
+    }
+
+    #[test]
+    fn list_help_describes_plugins_not_facet_modes() {
+        let err = Cli::try_parse_from(["aip-cli", "list", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        let text = err.render().to_string();
+        assert!(text.contains("plugin"), "{text}");
+        assert!(!text.contains("available modes"), "{text}");
+        assert!(!text.contains("mobile"), "{text}");
+    }
+
+    #[test]
+    fn mode_help_describes_plugin_selectors() {
+        let err = Cli::try_parse_from(["aip-cli", "mode", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        let text = err.render().to_string();
+        assert!(text.contains("plugin"), "{text}");
+        assert!(!text.contains("Pick a mode"), "{text}");
+        assert!(!text.contains("mobile"), "{text}");
     }
 
     #[test]

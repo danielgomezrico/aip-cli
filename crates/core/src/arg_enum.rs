@@ -1,5 +1,5 @@
 //! Shared parsing contract for small, case-insensitive CLI/marker argument
-//! enums (`Target`, `Role`, `Domain`, ...).
+//! enums (`Target`, ...).
 //!
 //! Each of these enums has historically hand-rolled the same normalization
 //! boilerplate at the top of its `parse`: `s.trim().to_ascii_lowercase()`
@@ -27,7 +27,6 @@ pub trait ArgEnum: Sized {
 mod tests {
     use super::*;
     use crate::mode_apply::Target;
-    use crate::modes::{Domain, Role};
 
     #[test]
     fn parse_normalizes_whitespace_and_case_target() {
@@ -37,8 +36,6 @@ mod tests {
     #[test]
     fn parse_unknown_token_yields_none() {
         assert_eq!(Target::parse("bogus"), None);
-        assert_eq!(Role::parse("bogus"), None);
-        assert_eq!(Domain::parse("bogus"), None);
     }
 
     #[test]
@@ -52,8 +49,6 @@ mod tests {
     #[test]
     fn one_alias_per_enum_still_resolves() {
         assert_eq!(Target::parse("claude-code"), Some(Target::ClaudeCode));
-        assert_eq!(Domain::parse("frontend"), Some(Domain::Web));
-        assert_eq!(Role::parse("pm"), Some(Role::ProductManager));
     }
 
     // -- Round-1 edge-case hunt: shared normalization contract -------------
@@ -68,9 +63,8 @@ mod tests {
     #[test]
     fn parse_does_not_strip_interior_whitespace() {
         // Normalization is trim + case-fold ONLY. A space is not an alias
-        // separator: "product manager" must NOT resolve like
-        // "product-manager" does.
-        assert_eq!(Role::parse("product manager"), None);
+        // separator: "claude code" must NOT resolve like "claude-code" does.
+        assert_eq!(Target::parse("claude code"), None);
     }
 
     #[test]
@@ -78,15 +72,12 @@ mod tests {
         // Case-folding must reach every enum's ALIAS arms, not just its
         // primary variant name — one representative alias per enum.
         assert_eq!(Target::parse("CLAUDE-CODE"), Some(Target::ClaudeCode));
-        assert_eq!(Domain::parse("FrontEnd"), Some(Domain::Web));
-        assert_eq!(Role::parse("PM"), Some(Role::ProductManager));
-        assert_eq!(Domain::parse("DEVOPS"), Some(Domain::Infra));
     }
 
     #[test]
     fn parse_empty_and_whitespace_only_yields_none() {
         assert_eq!(Target::parse(""), None);
-        assert_eq!(Domain::parse("   "), None);
+        assert_eq!(Target::parse("   "), None);
     }
 
     #[test]
@@ -94,7 +85,7 @@ mod tests {
         // Documented ascii-only contract: `to_ascii_lowercase` leaves
         // non-ASCII letters untouched, so a non-ASCII-cased token never
         // accidentally matches a variant even under full Unicode folding.
-        assert_eq!(Domain::parse("WËB"), None);
+        assert_eq!(Target::parse("GRÖK"), None);
     }
 
     #[test]
@@ -103,7 +94,6 @@ mod tests {
         // normalized; fed raw uppercase input directly, it must NOT match —
         // proving normalization is `parse`'s job alone, never duplicated.
         assert_eq!(Target::from_normalized("GROK"), None);
-        assert_eq!(Domain::from_normalized("WEB"), None);
     }
 
     #[test]
@@ -112,9 +102,6 @@ mod tests {
         // `<T as ArgEnum>::parse` — never hand-roll a diverging check.
         for input in ["claude", "GROK", "bogus"] {
             assert_eq!(Target::parse(input), <Target as ArgEnum>::parse(input));
-        }
-        for input in ["web", "  FRONTEND ", "bogus"] {
-            assert_eq!(Domain::parse(input), <Domain as ArgEnum>::parse(input));
         }
     }
 }

@@ -20,8 +20,8 @@ help:
 	@echo "  release       Cut a release (bump + tag + changelog)  [LEVEL=patch|minor|major]"
 	@echo ""
 	@echo "After 'make install':"
-	@echo "  $(BIN) mode <name>   # pick + apply a mode (saves .aip-cli.toml)"
-	@echo "  $(BIN) enable        # re-apply this folder's saved mode (manual; no auto-on-cd)"
+	@echo "  $(BIN) mode <plugin…>   # pick plugins (saves .aip-cli.toml)"
+	@echo "  $(BIN) enable           # re-apply this folder's saved plugins (manual; no auto-on-cd)"
 	@echo "Tab completion:"
 	@echo "  bash:  source <(\$$($(BIN) completion bash))   (or write to ~/.local/share/bash-completion/completions/$(BIN))"
 	@echo "  zsh:   mkdir -p ~/.zfunc && $(BIN) completion zsh > ~/.zfunc/_$(BIN)  (then fpath + compinit)"
@@ -48,7 +48,7 @@ lint:
 install: deps test
 	$(CARGO) install --path crates/cli --root $(PREFIX) --locked --force
 	@echo "✓ installed $(BIN) → $(PREFIX)/bin/$(BIN)"
-	@echo "  usage:    $(BIN) mode <name>   then later  $(BIN) enable"
+	@echo "  usage:    $(BIN) mode <plugin…>   then later  $(BIN) enable"
 	@echo "  complete: source <(\$$($(BIN) completion bash))   (bash)  or  $(BIN) completion zsh > ~/.zfunc/_$(BIN) (zsh)"
 
 uninstall:

@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 /// A plugin held in the `.aip-cli` store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorePlugin {
+    /// Store directory name (`android` when the folder is `…/plugins/android`).
+    pub dir_name: String,
+    /// Manifest `.name` (fallback: directory name when the manifest is unreadable).
     pub name: String,
     pub version: String,
 }
@@ -36,19 +39,24 @@ pub fn scan_store(plugins_root: &Path) -> Vec<StorePlugin> {
     let dirs: Vec<PathBuf> = read_plugin_dirs(plugins_root);
     let mut out: Vec<StorePlugin> = dirs
         .iter()
-        .map(|d| match PluginManifest::read(d) {
-            Ok(m) => StorePlugin {
-                name: m.name,
-                version: m.version,
-            },
-            Err(_) => StorePlugin {
-                name: d
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                version: "?".to_string(),
-            },
+        .map(|d| {
+            let dir_name = d
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            match PluginManifest::read(d) {
+                Ok(m) => StorePlugin {
+                    dir_name,
+                    name: m.name,
+                    version: m.version,
+                },
+                Err(_) => StorePlugin {
+                    dir_name: dir_name.clone(),
+                    name: dir_name,
+                    version: "?".to_string(),
+                },
+            }
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -131,14 +139,38 @@ fn mode_targets(pinned: Option<Target>, target: Target) -> bool {
     pinned.map(|p| p == target).unwrap_or(true)
 }
 
+/// True when `token` is this store entry's directory name or its manifest name.
+fn store_holds_token(p: &StorePlugin, token: &str) -> bool {
+    token == p.dir_name || token == p.name
+}
+
+/// True when any store entry is known as `token` (dir or manifest).
+fn store_holds(store: &[StorePlugin], token: &str) -> bool {
+    store.iter().any(|p| store_holds_token(p, token))
+}
+
+/// True when `a` and `b` name the same store plugin (exact or dir∥manifest).
+fn same_store_plugin(store: &[StorePlugin], a: &str, b: &str) -> bool {
+    a == b
+        || store
+            .iter()
+            .any(|p| store_holds_token(p, a) && store_holds_token(p, b))
+}
+
+/// Agent enabled-set membership that treats dir name and manifest name as one plugin.
+fn agent_enabled_for(state: &AgentPlugins, token: &str, store: &[StorePlugin]) -> bool {
+    state
+        .enabled
+        .iter()
+        .any(|e| same_store_plugin(store, e, token))
+}
+
 /// Assemble a [`DoctorReport`] from gathered inputs. Pure.
 pub fn build_report(
     project: ProjectInput,
     store: Vec<StorePlugin>,
     agents: Vec<AgentInput>,
 ) -> DoctorReport {
-    let store_names: Vec<&str> = store.iter().map(|p| p.name.as_str()).collect();
-
     // ── project ──
     let mut mode = None;
     let mut chosen = Vec::new();
@@ -188,7 +220,7 @@ pub fn build_report(
             let orphans: Vec<String> = state
                 .enabled
                 .iter()
-                .filter(|p| !store_names.contains(&p.as_str()))
+                .filter(|p| !store_holds(&store, p))
                 .cloned()
                 .collect();
 
@@ -198,7 +230,7 @@ pub fn build_report(
             let missing_wanted: Vec<String> = if targeted {
                 wants
                     .iter()
-                    .filter(|p| !state.is_enabled(p))
+                    .filter(|p| !agent_enabled_for(&state, p, &store))
                     .cloned()
                     .collect()
             } else {
@@ -206,10 +238,11 @@ pub fn build_report(
             };
             // Drift over the managed plugin universe only, so agent-specific
             // extras (e.g. plugins outside any mode) never count as drift.
+            // Dir name and manifest name of the same store entry are one plugin.
             let drift = targeted
                 && modes::all_plugins().iter().any(|p| {
-                    let want = wants.iter().any(|w| w == p);
-                    want != state.is_enabled(p)
+                    let want = wants.iter().any(|w| same_store_plugin(&store, w, p));
+                    want != agent_enabled_for(&state, p, &store)
                 });
 
             AgentStatus {
@@ -227,7 +260,7 @@ pub fn build_report(
 
     let wants_missing_from_store: Vec<String> = wants
         .iter()
-        .filter(|p| !store_names.contains(&p.as_str()))
+        .filter(|p| !store_holds(&store, p))
         .cloned()
         .collect();
 
@@ -394,11 +427,13 @@ fn render_agents(r: &DoctorReport, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::with_store_dir;
 
     fn store(names: &[&str]) -> Vec<StorePlugin> {
         names
             .iter()
             .map(|n| StorePlugin {
+                dir_name: n.to_string(),
                 name: n.to_string(),
                 version: "1.0.0".into(),
             })
@@ -429,6 +464,17 @@ mod tests {
         .unwrap();
     }
 
+    /// `~/.aip-cli` equivalent with valid plugin dirs under `plugins/`.
+    fn fixture_store(dirs: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let plugins = tmp.path().join("plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        for d in dirs {
+            write_plugin(&plugins, d, d, "1.0.0");
+        }
+        tmp
+    }
+
     #[test]
     fn no_marker_reports_clean_project() {
         let r = build_report(ProjectInput::default(), store(&[]), vec![]);
@@ -439,78 +485,102 @@ mod tests {
 
     #[test]
     fn resolves_marker_mode_to_wanted_plugins() {
-        let proj = ProjectInput {
-            marker: Some(PathBuf::from("/repo/.aip-cli.toml")),
-            marker_text: Some("mode = \"minimal\"".into()),
-            trusted: true,
-            applied_hash: None,
-        };
-        let r = build_report(
-            proj,
-            store(&["ai-architecture", "software-engineer"]),
-            vec![],
-        );
-        assert_eq!(r.project.mode.as_deref(), Some("minimal"));
-        assert_eq!(r.project.chosen, vec!["minimal"]);
-        assert_eq!(
-            r.project.wants,
-            vec!["ai-architecture", "software-engineer"]
-        );
-        assert!(r.wants_missing_from_store.is_empty());
+        let tmp = fixture_store(&["apple", "frontend"]);
+        with_store_dir(tmp.path(), || {
+            let proj = ProjectInput {
+                marker: Some(PathBuf::from("/repo/.aip-cli.toml")),
+                marker_text: Some("mode = \"apple\"".into()),
+                trusted: true,
+                applied_hash: None,
+            };
+            let r = build_report(proj, store(&["apple"]), vec![]);
+            assert_eq!(r.project.mode.as_deref(), Some("apple"));
+            assert_eq!(r.project.chosen, vec!["apple"]);
+            assert_eq!(r.project.wants, vec!["apple"]);
+            assert!(r.wants_missing_from_store.is_empty());
+        });
     }
 
     #[test]
     fn flags_wanted_plugin_missing_from_store() {
-        let proj = ProjectInput {
-            marker: Some(PathBuf::from("/m")),
-            marker_text: Some("mode = \"minimal\"".into()),
-            trusted: true,
-            applied_hash: None,
-        };
-        // store lacks software-engineer
-        let r = build_report(proj, store(&["ai-architecture"]), vec![]);
-        assert_eq!(r.wants_missing_from_store, vec!["software-engineer"]);
-        assert!(render(&r).contains("not in store"));
+        let tmp = fixture_store(&["apple", "backend-go"]);
+        with_store_dir(tmp.path(), || {
+            let proj = ProjectInput {
+                marker: Some(PathBuf::from("/m")),
+                marker_text: Some("mode = \"apple backend-go\"".into()),
+                trusted: true,
+                applied_hash: None,
+            };
+            // in-memory store list lacks backend-go (disk still has it for resolve)
+            let r = build_report(proj, store(&["apple"]), vec![]);
+            assert_eq!(r.wants_missing_from_store, vec!["backend-go"]);
+            assert!(render(&r).contains("not in store"));
+        });
     }
 
     #[test]
     fn active_when_applied_hash_matches() {
-        let text = "mode = \"minimal\"".to_string();
-        let proj = ProjectInput {
-            marker: Some(PathBuf::from("/m")),
-            marker_text: Some(text.clone()),
-            trusted: true,
-            applied_hash: Some(content_hash(&text)),
-        };
-        let r = build_report(proj, store(&[]), vec![]);
-        assert!(r.project.active);
-        assert!(render(&r).contains("active (mode applied)"));
+        let tmp = fixture_store(&["apple"]);
+        with_store_dir(tmp.path(), || {
+            let text = "mode = \"apple\"".to_string();
+            let proj = ProjectInput {
+                marker: Some(PathBuf::from("/m")),
+                marker_text: Some(text.clone()),
+                trusted: true,
+                applied_hash: Some(content_hash(&text)),
+            };
+            let r = build_report(proj, store(&["apple"]), vec![]);
+            assert!(r.project.active);
+            assert!(render(&r).contains("active (mode applied)"));
+        });
     }
 
     #[test]
     fn not_active_when_untrusted_even_if_hash_matches() {
-        let text = "mode = \"minimal\"".to_string();
-        let proj = ProjectInput {
-            marker: Some(PathBuf::from("/m")),
-            marker_text: Some(text.clone()),
-            trusted: false,
-            applied_hash: Some(content_hash(&text)),
-        };
-        let r = build_report(proj, store(&[]), vec![]);
-        assert!(!r.project.active);
+        let tmp = fixture_store(&["apple"]);
+        with_store_dir(tmp.path(), || {
+            let text = "mode = \"apple\"".to_string();
+            let proj = ProjectInput {
+                marker: Some(PathBuf::from("/m")),
+                marker_text: Some(text.clone()),
+                trusted: false,
+                applied_hash: Some(content_hash(&text)),
+            };
+            let r = build_report(proj, store(&["apple"]), vec![]);
+            assert!(!r.project.active);
+        });
     }
 
     #[test]
     fn invalid_mode_records_error() {
-        let proj = ProjectInput {
-            marker: Some(PathBuf::from("/m")),
-            marker_text: Some("mode = \"nope\"".into()),
-            trusted: true,
-            applied_hash: None,
-        };
-        let r = build_report(proj, store(&[]), vec![]);
-        assert!(r.project.error.is_some());
-        assert!(render(&r).contains("invalid mode"));
+        let tmp = fixture_store(&["apple"]);
+        with_store_dir(tmp.path(), || {
+            let proj = ProjectInput {
+                marker: Some(PathBuf::from("/m")),
+                marker_text: Some("mode = \"nope\"".into()),
+                trusted: true,
+                applied_hash: None,
+            };
+            let r = build_report(proj, store(&[]), vec![]);
+            assert!(r.project.error.is_some());
+            assert!(render(&r).contains("invalid mode"));
+        });
+    }
+
+    #[test]
+    fn invalid_mobile_mode_records_error() {
+        let tmp = fixture_store(&["apple"]);
+        with_store_dir(tmp.path(), || {
+            let proj = ProjectInput {
+                marker: Some(PathBuf::from("/m")),
+                marker_text: Some("mode = \"mobile\"".into()),
+                trusted: true,
+                applied_hash: None,
+            };
+            let r = build_report(proj, store(&["apple"]), vec![]);
+            assert!(r.project.error.is_some());
+            assert!(render(&r).contains("invalid mode"));
+        });
     }
 
     #[test]
@@ -528,76 +598,75 @@ mod tests {
     #[test]
     fn orphan_enabled_plugin_not_in_store_is_flagged() {
         let agents = vec![agent(Target::Grok, true, &["it-manager"], &[])];
-        let r = build_report(ProjectInput::default(), store(&["ai-architecture"]), agents);
+        let r = build_report(ProjectInput::default(), store(&["apple"]), agents);
         assert_eq!(r.agents[0].orphans, vec!["it-manager"]);
         assert!(render(&r).contains("enabled but not in store: it-manager"));
     }
 
     #[test]
     fn drift_detected_when_agent_missing_a_wanted_plugin() {
-        let proj = ProjectInput {
-            marker: Some(PathBuf::from("/m")),
-            marker_text: Some("mode = \"minimal\"".into()),
-            trusted: true,
-            applied_hash: None,
-        };
-        // minimal wants ai-architecture + software-engineer; agent has only one.
-        let agents = vec![agent(
-            Target::ClaudeCode,
-            true,
-            &["ai-architecture"],
-            &["software-engineer"],
-        )];
-        let r = build_report(
-            proj,
-            store(&["ai-architecture", "software-engineer"]),
-            agents,
-        );
-        assert!(r.agents[0].drift);
-        assert_eq!(r.agents[0].missing_wanted, vec!["software-engineer"]);
+        let tmp = fixture_store(&["apple", "frontend"]);
+        with_store_dir(tmp.path(), || {
+            let proj = ProjectInput {
+                marker: Some(PathBuf::from("/m")),
+                marker_text: Some("mode = \"apple frontend\"".into()),
+                trusted: true,
+                applied_hash: None,
+            };
+            let agents = vec![agent(Target::ClaudeCode, true, &["apple"], &["frontend"])];
+            let r = build_report(proj, store(&["apple", "frontend"]), agents);
+            assert!(r.agents[0].drift);
+            assert_eq!(r.agents[0].missing_wanted, vec!["frontend"]);
+        });
     }
 
     #[test]
     fn no_drift_when_agent_matches_mode_exactly() {
-        let proj = ProjectInput {
-            marker: Some(PathBuf::from("/m")),
-            marker_text: Some("mode = \"minimal\"".into()),
-            trusted: true,
-            applied_hash: None,
-        };
-        let agents = vec![agent(
-            Target::ClaudeCode,
-            true,
-            &["ai-architecture", "software-engineer"],
-            &["flutter-pivara"],
-        )];
-        let r = build_report(proj, store(&[]), agents);
-        assert!(!r.agents[0].drift);
-        assert!(render(&r).contains("matches project mode"));
+        let tmp = fixture_store(&["apple", "frontend"]);
+        with_store_dir(tmp.path(), || {
+            let proj = ProjectInput {
+                marker: Some(PathBuf::from("/m")),
+                marker_text: Some("mode = \"apple\"".into()),
+                trusted: true,
+                applied_hash: None,
+            };
+            // flutter-pivara is outside the fixture universe and must not count as drift.
+            let agents = vec![agent(
+                Target::ClaudeCode,
+                true,
+                &["apple", "flutter-pivara"],
+                &[],
+            )];
+            let r = build_report(proj, store(&["apple", "frontend"]), agents);
+            assert!(!r.agents[0].drift);
+            assert!(render(&r).contains("matches project mode"));
+        });
     }
 
     #[test]
     fn pinned_marker_skips_drift_for_other_agent() {
-        let proj = ProjectInput {
-            marker: Some(PathBuf::from("/m")),
-            marker_text: Some("mode = \"minimal\"\ntarget = \"grok\"".into()),
-            trusted: true,
-            applied_hash: None,
-        };
-        // Claude has nothing enabled, but the marker pins grok, so no drift.
-        let agents = vec![agent(Target::ClaudeCode, true, &[], &[])];
-        let r = build_report(proj, store(&[]), agents);
-        assert_eq!(r.project.pinned, Some(Target::Grok));
-        assert!(!r.agents[0].drift);
-        assert!(r.agents[0].missing_wanted.is_empty());
+        let tmp = fixture_store(&["apple"]);
+        with_store_dir(tmp.path(), || {
+            let proj = ProjectInput {
+                marker: Some(PathBuf::from("/m")),
+                marker_text: Some("mode = \"apple\"\ntarget = \"grok\"".into()),
+                trusted: true,
+                applied_hash: None,
+            };
+            // Claude has nothing enabled, but the marker pins grok, so no drift.
+            let agents = vec![agent(Target::ClaudeCode, true, &[], &[])];
+            let r = build_report(proj, store(&["apple"]), agents);
+            assert_eq!(r.project.pinned, Some(Target::Grok));
+            assert!(!r.agents[0].drift);
+            assert!(r.agents[0].missing_wanted.is_empty());
+        });
     }
 
     #[test]
     fn scan_store_keys_by_manifest_name_not_dir_name() {
         // Regression: the `android` folder holds the `android-native` plugin and
-        // `flutter` holds `flutter-pivara`. The store list must be keyed by the
-        // manifest name (what agents and modes use), not the directory name —
-        // otherwise doctor reports these plugins as missing/orphaned.
+        // `flutter` holds `flutter-pivara`. The store list is still keyed/sorted
+        // by manifest name — do not invert to “keyed by dir”.
         let tmp = tempfile::TempDir::new().unwrap();
         write_plugin(tmp.path(), "android", "android-native", "1.0.1");
         write_plugin(tmp.path(), "flutter", "flutter-pivara", "1.1.0");
@@ -607,6 +676,8 @@ mod tests {
         let scanned = scan_store(tmp.path());
         let names: Vec<&str> = scanned.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["android-native", "flutter-pivara", "product"]);
+        assert_eq!(scanned[0].dir_name, "android");
+        assert_eq!(scanned[0].name, "android-native");
         assert_eq!(scanned[0].version, "1.0.1");
     }
 
@@ -626,6 +697,32 @@ mod tests {
     }
 
     #[test]
+    fn wants_dir_matches_store_manifest_alias() {
+        // Want the directory name; agent enabled the manifest name of the same
+        // store entry — not missing from store, not missing on the agent, no drift.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let plugins = tmp.path().join("plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        write_plugin(&plugins, "android", "android-native", "1.0.1");
+
+        with_store_dir(tmp.path(), || {
+            let proj = ProjectInput {
+                marker: Some(PathBuf::from("/m")),
+                marker_text: Some("mode = \"android\"".into()),
+                trusted: true,
+                applied_hash: None,
+            };
+            let agents = vec![agent(Target::ClaudeCode, true, &["android-native"], &[])];
+            let r = build_report(proj, scan_store(&plugins), agents);
+            assert_eq!(r.project.wants, vec!["android"]);
+            assert!(r.wants_missing_from_store.is_empty());
+            assert!(r.agents[0].missing_wanted.is_empty());
+            assert!(!r.agents[0].drift);
+            assert!(r.agents[0].orphans.is_empty());
+        });
+    }
+
+    #[test]
     fn scan_store_falls_back_to_dir_name_on_unreadable_manifest() {
         // A plugin dir whose manifest is present but malformed still appears,
         // keyed by its directory name with an unknown version, instead of vanishing.
@@ -636,6 +733,7 @@ mod tests {
 
         let scanned = scan_store(tmp.path());
         assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].dir_name, "broken");
         assert_eq!(scanned[0].name, "broken");
         assert_eq!(scanned[0].version, "?");
     }

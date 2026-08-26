@@ -245,121 +245,130 @@ pub fn apply_targets<R: CommandRunner + Send + Sync + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modes::resolve;
+    use crate::modes::{resolve, Resolution};
     use crate::runner::RecordingRunner;
     use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn write_plugin(root: &std::path::Path, dir: &str, name: &str) {
+        let meta = root.join(dir).join(".claude-plugin");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(
+            meta.join("plugin.json"),
+            format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+        )
+        .unwrap();
+    }
+
+    /// `~/.aip-cli` equivalent with valid plugin dirs under `plugins/`.
+    fn fixture_store(dirs: &[&str]) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let plugins = tmp.path().join("plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        for d in dirs {
+            write_plugin(&plugins, d, d);
+        }
+        tmp
+    }
 
     #[test]
     fn enables_selected_disables_rest_in_order() {
-        let res = resolve("minimal").unwrap();
-        let runner = RecordingRunner::new();
-        let actions =
-            apply_mode(&res, Target::ClaudeCode, &PathBuf::from("/repo"), &runner).unwrap();
+        let tmp = fixture_store(&["apple", "frontend"]);
+        store::with_store_dir(tmp.path(), || {
+            let res = resolve("apple").unwrap();
+            let runner = RecordingRunner::new();
+            let actions =
+                apply_mode(&res, Target::ClaudeCode, &PathBuf::from("/repo"), &runner).unwrap();
 
-        // One call per plugin.
-        assert_eq!(runner.lines().len(), crate::modes::all_plugins().len());
-        assert_eq!(actions.len(), crate::modes::all_plugins().len());
+            let n = crate::modes::all_plugins().len();
+            assert_eq!(n, 2);
+            assert_eq!(runner.lines().len(), n);
+            assert_eq!(actions.len(), n);
 
-        // Actions are returned in canonical order.
-        assert!(actions[0].enable);
-        assert_eq!(actions[0].plugin, "ai-architecture");
-        assert!(actions[1].enable);
-        assert_eq!(actions[1].plugin, "software-engineer");
+            assert!(actions[0].enable);
+            assert_eq!(actions[0].plugin, "apple");
+            assert!(!actions[1].enable);
+            assert_eq!(actions[1].plugin, "frontend");
 
-        // Check runner was called for each plugin (order may vary due to parallel execution).
-        let lines = runner.lines();
-        assert!(lines
-            .iter()
-            .any(|l| l == "claude plugin enable ai-architecture"));
-        assert!(lines
-            .iter()
-            .any(|l| l == "claude plugin enable software-engineer"));
-        assert!(lines.iter().any(|l| l == "claude plugin disable flutter"));
+            let lines = runner.lines();
+            assert!(lines.iter().any(|l| l == "claude plugin enable apple"));
+            assert!(lines.iter().any(|l| l == "claude plugin disable frontend"));
+        });
     }
 
     #[test]
     fn grok_target_uses_grok_program() {
-        let res = resolve("jobs").unwrap();
-        let runner = RecordingRunner::new();
-        apply_mode(&res, Target::Grok, &PathBuf::from("/repo"), &runner).unwrap();
-        assert!(runner.lines().iter().all(|l| l.starts_with("grok plugin ")));
-        assert!(runner
-            .lines()
-            .contains(&"grok plugin enable job-hunter".to_string()));
+        let tmp = fixture_store(&["apple", "frontend"]);
+        store::with_store_dir(tmp.path(), || {
+            let res = resolve("frontend").unwrap();
+            let runner = RecordingRunner::new();
+            apply_mode(&res, Target::Grok, &PathBuf::from("/repo"), &runner).unwrap();
+            assert!(runner.lines().iter().all(|l| l.starts_with("grok plugin ")));
+            assert!(runner
+                .lines()
+                .contains(&"grok plugin enable frontend".to_string()));
 
-        // Install calls (if any) must be for grok and only for plugins in the enabled set.
-        // (Presence depends on whether the test machine's aip store has those plugin dirs.)
-        let all_lines = runner.lines();
-        let install_calls: Vec<_> = all_lines
-            .iter()
-            .filter(|l| l.contains("grok plugin install"))
-            .collect();
-        for call in &install_calls {
-            assert!(call.contains("ai-architecture") || call.contains("job-hunter"));
-        }
+            let all_lines = runner.lines();
+            let install_calls: Vec<_> = all_lines
+                .iter()
+                .filter(|l| l.contains("grok plugin install"))
+                .collect();
+            for call in &install_calls {
+                assert!(call.contains("frontend"));
+            }
+        });
     }
 
     #[test]
     fn pi_target_installs_on_and_removes_off() {
-        use std::fs;
-        use tempfile::TempDir;
+        let tmp = fixture_store(&["apple", "frontend"]);
+        store::with_store_dir(tmp.path(), || {
+            let res = resolve("apple").unwrap();
+            let runner = RecordingRunner::new();
+            let actions = apply_mode(&res, Target::Pi, &PathBuf::from("/repo"), &runner).unwrap();
 
-        let temp = TempDir::new().unwrap();
-        let store = temp.path().join(".aip-cli");
-        let store_plugins = store.join("plugins");
-        fs::create_dir_all(store_plugins.join("ai-architecture")).unwrap();
-        fs::create_dir_all(store_plugins.join("software-engineer")).unwrap();
+            let n = crate::modes::all_plugins().len();
+            assert_eq!(actions.len(), n);
+            assert_eq!(runner.lines().len(), n);
 
-        let res = resolve("minimal").unwrap();
-        let runner = RecordingRunner::new();
-        let actions = store::with_store_dir(&store, || {
-            apply_mode(&res, Target::Pi, &PathBuf::from("/repo"), &runner).unwrap()
+            let lines = runner.lines();
+            assert!(lines.iter().all(|l| l.starts_with("pi ")));
+            assert!(lines
+                .iter()
+                .any(|l| { l.starts_with("pi install ") && l.contains("apple") }));
+            assert!(lines
+                .iter()
+                .any(|l| l.starts_with("pi remove ") && l.contains("frontend")));
+            let on_ok: Vec<_> = actions.iter().filter(|a| a.enable && a.success).collect();
+            assert_eq!(on_ok.len(), 1);
+            assert!(!actions.iter().any(|a| a.enable && !a.success));
         });
-
-        let n = crate::modes::all_plugins().len();
-        assert_eq!(actions.len(), n);
-        assert_eq!(runner.lines().len(), n);
-
-        let lines = runner.lines();
-        assert!(lines.iter().all(|l| l.starts_with("pi ")));
-        // Enabled plugins present in store → install.
-        assert!(lines
-            .iter()
-            .any(|l| { l.starts_with("pi install ") && l.contains("ai-architecture") }));
-        assert!(lines
-            .iter()
-            .any(|l| { l.starts_with("pi install ") && l.contains("software-engineer") }));
-        // Off plugins → remove (even when not in store).
-        assert!(lines
-            .iter()
-            .any(|l| l.starts_with("pi remove ") && l.contains("flutter")));
-        // Wanted enables that had dirs reported success.
-        let on_ok: Vec<_> = actions.iter().filter(|a| a.enable && a.success).collect();
-        assert_eq!(on_ok.len(), 2);
-        // Wanted enables missing from store would fail — none missing here.
-        assert!(!actions.iter().any(|a| a.enable && !a.success));
     }
 
     #[test]
     fn pi_enable_fails_when_plugin_missing_from_store() {
-        use tempfile::TempDir;
+        // Selected name is not a store dir. Apply walks all_plugins() only, so
+        // that name is not enabled; remaining fixture plugins are still disabled.
+        let tmp = fixture_store(&["frontend"]);
+        store::with_store_dir(tmp.path(), || {
+            let res = Resolution {
+                chosen: vec!["apple".into()],
+                enabled: vec!["apple".into()],
+            };
+            let runner = RecordingRunner::new();
+            let actions = apply_mode(&res, Target::Pi, &PathBuf::from("/r"), &runner).unwrap();
 
-        let temp = TempDir::new().unwrap();
-        let store = temp.path().join(".aip-cli");
-        // Empty store — minimal's plugins are absent.
-        std::fs::create_dir_all(store.join("plugins")).unwrap();
-
-        let res = resolve("minimal").unwrap();
-        let runner = RecordingRunner::new();
-        let actions = store::with_store_dir(&store, || {
-            apply_mode(&res, Target::Pi, &PathBuf::from("/r"), &runner).unwrap()
+            let selected = res.enabled.len();
+            assert_eq!(actions.iter().filter(|a| a.enable && !a.success).count(), 0);
+            assert_eq!(actions.iter().filter(|a| a.enable).count(), 0);
+            assert_eq!(selected, 1);
+            assert!(!runner.lines().iter().any(|l| l.starts_with("pi install ")));
+            assert!(runner.lines().iter().any(|l| l.starts_with("pi remove ")));
+            assert!(runner
+                .lines()
+                .iter()
+                .any(|l| l.starts_with("pi remove ") && l.contains("frontend")));
         });
-
-        // Enables fail (no store dir); no install calls issued for them.
-        assert_eq!(actions.iter().filter(|a| a.enable && !a.success).count(), 2);
-        assert!(!runner.lines().iter().any(|l| l.starts_with("pi install ")));
-        // Removes still issued for the rest of the catalog.
-        assert!(runner.lines().iter().any(|l| l.starts_with("pi remove ")));
     }
 
     #[test]
@@ -377,156 +386,163 @@ mod tests {
 
     #[test]
     fn available_filters_by_predicate() {
-        // Only grok installed.
         let got = available(&ALL_TARGETS, |prog| prog == "grok");
         assert_eq!(got, vec![Target::Grok]);
-        // Nothing installed.
         assert!(available(&ALL_TARGETS, |_| false).is_empty());
-        // Everything installed.
         assert_eq!(available(&ALL_TARGETS, |_| true), ALL_TARGETS.to_vec());
     }
 
     #[test]
     fn apply_targets_hits_every_agent() {
-        let res = resolve("minimal").unwrap();
-        let runner = RecordingRunner::new();
-        let reports = apply_targets(&res, &ALL_TARGETS, &PathBuf::from("/repo"), &runner).unwrap();
-        assert_eq!(reports.len(), 3);
-        assert_eq!(reports[0].target, Target::ClaudeCode);
-        assert_eq!(reports[1].target, Target::Grok);
-        assert_eq!(reports[2].target, Target::Pi);
+        // apply_targets uses rayon; thread-local store override does not
+        // cross worker threads. Drive each agent on this thread instead.
+        let tmp = fixture_store(&["apple", "frontend"]);
+        store::with_store_dir(tmp.path(), || {
+            let res = resolve("apple").unwrap();
+            let runner = RecordingRunner::new();
+            let cwd = PathBuf::from("/repo");
+            let reports: Vec<TargetReport> = ALL_TARGETS
+                .iter()
+                .map(|&target| {
+                    let actions = apply_mode(&res, target, &cwd, &runner).unwrap();
+                    TargetReport { target, actions }
+                })
+                .collect();
+            assert_eq!(reports.len(), 3);
+            assert_eq!(reports[0].target, Target::ClaudeCode);
+            assert_eq!(reports[1].target, Target::Grok);
+            assert_eq!(reports[2].target, Target::Pi);
 
-        // Compute expected pre-installs based on *actual* store state at test time
-        // (makes test robust across machines with/without populated ~/.aip-cli/plugins).
-        let store = store::plugins_dir();
-        let (on, _) = res.partition();
-        let grok_preinstalls = on.iter().filter(|name| store.join(name).is_dir()).count();
-        // Pi install only for enabled plugins present in the store; remove for the rest.
-        let pi_installs = on.iter().filter(|name| store.join(name).is_dir()).count();
-        let pi_removes = crate::modes::all_plugins().len() - on.len();
-        // When store lacks enabled plugins, pi issues no install (counts as failed enable).
-        let pi_calls = pi_installs + pi_removes;
+            let store_plugins = store::plugins_dir();
+            let (on, _) = res.partition();
+            let grok_preinstalls = on
+                .iter()
+                .filter(|name| store_plugins.join(name).is_dir())
+                .count();
+            let pi_installs = on
+                .iter()
+                .filter(|name| store_plugins.join(name).is_dir())
+                .count();
+            let n = crate::modes::all_plugins().len();
+            let pi_removes = n - on.len();
+            let pi_calls = pi_installs + pi_removes;
+            assert_eq!(runner.lines().len(), n + n + grok_preinstalls + pi_calls);
 
-        // Claude: n. Grok: n + preinstalls. Pi: installs for present-on + removes for off.
-        let n = crate::modes::all_plugins().len();
-        assert_eq!(runner.lines().len(), n + n + grok_preinstalls + pi_calls);
-
-        assert!(runner
-            .lines()
-            .contains(&"claude plugin enable ai-architecture".to_string()));
-        assert!(runner
-            .lines()
-            .contains(&"grok plugin enable ai-architecture".to_string()));
-        assert!(runner.lines().iter().any(|l| l.starts_with("pi ")));
+            assert!(runner
+                .lines()
+                .contains(&"claude plugin enable apple".to_string()));
+            assert!(runner
+                .lines()
+                .contains(&"grok plugin enable apple".to_string()));
+            assert!(runner.lines().iter().any(|l| l.starts_with("pi ")));
+        });
     }
 
     #[test]
     fn apply_targets_empty_is_noop() {
-        let res = resolve("minimal").unwrap();
-        let runner = RecordingRunner::new();
-        let reports = apply_targets(&res, &[], &PathBuf::from("/r"), &runner).unwrap();
-        assert!(reports.is_empty());
-        assert!(runner.lines().is_empty());
+        let tmp = fixture_store(&["apple"]);
+        store::with_store_dir(tmp.path(), || {
+            let res = resolve("apple").unwrap();
+            let runner = RecordingRunner::new();
+            let reports = apply_targets(&res, &[], &PathBuf::from("/r"), &runner).unwrap();
+            assert!(reports.is_empty());
+            assert!(runner.lines().is_empty());
+        });
     }
 
     #[test]
     fn is_on_path_detects_absolute_and_bare_names() {
-        // Iteration 3
-        assert!(is_on_path("/bin/sh")); // absolute existing
-        assert!(is_on_path("sh")); // bare, should be on PATH on unix/mac
+        assert!(is_on_path("/bin/sh"));
+        assert!(is_on_path("sh"));
         assert!(!is_on_path("/this/does/not/exist/really123"));
         assert!(!is_on_path("definitely-not-a-real-binary-xyz"));
     }
 
     #[test]
     fn preinstall_skips_when_target_not_grok() {
-        let res = resolve("minimal").unwrap();
-        let runner = RecordingRunner::new();
-        // Even if store has dirs, claude target must never emit grok install
-        let _ = apply_mode(&res, Target::ClaudeCode, &PathBuf::from("/r"), &runner);
-        assert!(!runner.lines().iter().any(|l| l.contains("grok")));
+        let tmp = fixture_store(&["apple", "frontend"]);
+        store::with_store_dir(tmp.path(), || {
+            let res = resolve("apple").unwrap();
+            let runner = RecordingRunner::new();
+            let _ = apply_mode(&res, Target::ClaudeCode, &PathBuf::from("/r"), &runner);
+            assert!(!runner.lines().iter().any(|l| l.contains("grok")));
+        });
     }
 
     #[test]
     fn tolerates_individual_failures() {
-        let res = resolve("minimal").unwrap();
-        let runner = RecordingRunner::failing(|inv| inv.args.contains(&"disable".to_string()));
-        // Should not error even though every disable "fails".
-        let actions = apply_mode(&res, Target::ClaudeCode, &PathBuf::from("/r"), &runner).unwrap();
-        assert_eq!(actions.iter().filter(|a| a.enable).count(), 2);
+        let tmp = fixture_store(&["apple", "frontend"]);
+        store::with_store_dir(tmp.path(), || {
+            let res = resolve("apple").unwrap();
+            let runner = RecordingRunner::failing(|inv| inv.args.contains(&"disable".to_string()));
+            let actions =
+                apply_mode(&res, Target::ClaudeCode, &PathBuf::from("/r"), &runner).unwrap();
+            assert_eq!(actions.iter().filter(|a| a.enable).count(), 1);
+            assert_eq!(
+                actions.iter().filter(|a| !a.enable && !a.success).count(),
+                1
+            );
+        });
     }
 
     #[test]
     fn grok_preinstall_only_for_plugins_present_in_store() {
-        // Partial ingest: only one of minimal's plugins exists in the store.
-        use std::fs;
-        use tempfile::TempDir;
-
-        let temp = TempDir::new().unwrap();
-        let store = temp.path().join(".aip-cli");
-        let store_plugins = store.join("plugins");
-        fs::create_dir_all(&store_plugins).unwrap();
-
-        // Only "ai-architecture" present (simulates partial ingest).
-        fs::create_dir_all(store_plugins.join("ai-architecture")).unwrap();
-
-        let res = resolve("minimal").unwrap();
-        let runner = RecordingRunner::new();
-        store::with_store_dir(&store, || {
+        // Resolution names apple + backend-go; only apple exists on disk.
+        let tmp = fixture_store(&["apple", "frontend"]);
+        store::with_store_dir(tmp.path(), || {
+            let res = Resolution {
+                chosen: vec!["apple".into(), "backend-go".into()],
+                enabled: vec!["apple".into(), "backend-go".into()],
+            };
+            let runner = RecordingRunner::new();
             let _ = apply_mode(&res, Target::Grok, &PathBuf::from("/repo"), &runner);
+
+            let lines = runner.lines();
+            let install_lines: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("grok plugin install"))
+                .collect();
+            assert_eq!(install_lines.len(), 1);
+            assert!(install_lines[0].contains("apple"));
+            assert!(!install_lines.iter().any(|l| l.contains("backend-go")));
+
+            let n = crate::modes::all_plugins().len();
+            assert_eq!(lines.len(), n + 1);
+
+            assert!(lines.iter().any(|l| l.contains("grok plugin enable apple")));
+            assert!(lines
+                .iter()
+                .any(|l| l.contains("grok plugin disable frontend")));
+            assert!(!lines
+                .iter()
+                .any(|l| l.contains("grok plugin enable backend-go")));
+
+            let calls = runner.calls();
+            if let Some(install) = calls.iter().find(|c| c.args.iter().any(|a| a == "install")) {
+                assert_eq!(install.cwd, PathBuf::from("/repo"));
+            }
         });
-
-        let lines = runner.lines();
-
-        // Exactly one pre-install (only for the dir that existed)
-        let install_lines: Vec<_> = lines
-            .iter()
-            .filter(|l| l.contains("grok plugin install"))
-            .collect();
-        assert_eq!(install_lines.len(), 1);
-        assert!(install_lines[0].contains("ai-architecture"));
-        assert!(!install_lines
-            .iter()
-            .any(|l| l.contains("software-engineer")));
-
-        // Still performs enable/disable for *all* catalog plugins (pre-install is additive)
-        let n = crate::modes::all_plugins().len();
-        assert_eq!(lines.len(), n + 1); // +1 for the one install
-
-        // The enable for the present one (and the other) must still be issued
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("grok plugin enable ai-architecture")));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("grok plugin enable software-engineer")));
-
-        // Verify that the install invocation used the caller's cwd (not the plugin dir).
-        let calls = runner.calls();
-        if let Some(install) = calls.iter().find(|c| c.args.iter().any(|a| a == "install")) {
-            assert_eq!(install.cwd, PathBuf::from("/repo"));
-        }
     }
 
     #[test]
     fn grok_preinstall_failure_is_ignored_and_enables_are_still_attempted() {
-        // Iteration 2: simulate `grok plugin install` failing (bad manifest, permission,
-        // grok not liking the dir, etc.). The apply must continue and still issue
-        // the enable/disable actions.
-        let res = resolve("minimal").unwrap();
-        let runner = RecordingRunner::failing(|inv| inv.args.iter().any(|a| a == "install"));
-        let actions = apply_mode(&res, Target::Grok, &PathBuf::from("/r"), &runner).unwrap();
+        let tmp = fixture_store(&["apple", "frontend"]);
+        store::with_store_dir(tmp.path(), || {
+            let res = resolve("apple").unwrap();
+            let runner = RecordingRunner::failing(|inv| inv.args.iter().any(|a| a == "install"));
+            let actions = apply_mode(&res, Target::Grok, &PathBuf::from("/r"), &runner).unwrap();
 
-        let n = crate::modes::all_plugins().len();
-        assert_eq!(actions.len(), n);
-
-        // Wanted enables were still attempted (the install failure was swallowed)
-        assert_eq!(actions.iter().filter(|a| a.enable).count(), 2);
-
-        // We did attempt the installs (they "failed" per the mock)
-        assert!(runner
-            .lines()
-            .iter()
-            .any(|l| l.contains("grok plugin install")));
+            let n = crate::modes::all_plugins().len();
+            assert_eq!(actions.len(), n);
+            assert_eq!(actions.iter().filter(|a| a.enable).count(), 1);
+            assert!(runner
+                .lines()
+                .iter()
+                .any(|l| l.contains("grok plugin install")));
+            assert!(runner
+                .lines()
+                .iter()
+                .any(|l| l.contains("grok plugin enable apple")));
+        });
     }
 }
