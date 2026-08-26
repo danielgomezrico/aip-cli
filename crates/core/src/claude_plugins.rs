@@ -166,15 +166,12 @@ pub fn is_installed(home: &Path, plugin: &str, marketplace: &str) -> bool {
 /// Guarantee a store plugin is installed for Claude and serving the store's
 /// latest code.
 ///
-/// 1. Marketplace refresh, keyed by `marketplace` (the marketplace.json name):
-///    if the recorded `installLocation` has drifted off `store_root`, re-register
-///    (`remove` + `add <store_root>/<dir_name>`); otherwise `marketplace update`.
-/// 2. Install guarantee: if `<manifest>@<marketplace>` is not present in
-///    `installed_plugins.json`, `plugin install <manifest>@<marketplace>`.
+/// 1. Marketplace: `add <store>/<dir>` when unregistered or when
+///    `installLocation` has drifted off `store_root`; otherwise `update`.
+/// 2. Install: `plugin install <manifest>@<marketplace>` if missing from
+///    `installed_plugins.json`.
 ///
-/// Marketplace registration always precedes install. Best-effort throughout — a
-/// plugin the user never registered with Claude (or a missing `claude`) must not
-/// abort setup.
+/// Best-effort throughout — a missing `claude` must not abort setup.
 pub fn sync_installed_plugin<R: CommandRunner + ?Sized>(
     runner: &R,
     home: &Path,
@@ -182,24 +179,24 @@ pub fn sync_installed_plugin<R: CommandRunner + ?Sized>(
     dir_name: &str,
     manifest: &str,
     marketplace: &str,
-    cwd: &Path,
+    plugin_path: &Path,
 ) {
-    // 1. Marketplace refresh.
+    let cwd = plugin_path;
+    let install_root = store_root.join(dir_name);
     let known = read_known_marketplaces(home);
-    let drifted = match known.get(marketplace) {
+    let needs_add = match known.get(marketplace) {
         Some(loc) => !install_location_into_store(loc, store_root),
-        // Not yet registered: `update` is a harmless no-op; the initial `add`
-        // is the plugin's own `make setup` job.
-        None => false,
+        None => true,
     };
-    if drifted {
-        let _ = runner.run(&marketplace_remove_invocation(marketplace, cwd));
-        let _ = runner.run(&marketplace_add_invocation(&store_root.join(dir_name), cwd));
+    if needs_add {
+        if known.contains_key(marketplace) {
+            let _ = runner.run(&marketplace_remove_invocation(marketplace, cwd));
+        }
+        let _ = runner.run(&marketplace_add_invocation(&install_root, cwd));
     } else {
         let _ = runner.run(&marketplace_update_invocation(marketplace, cwd));
     }
 
-    // 2. Install guarantee — after the marketplace is registered/fresh.
     if !is_installed(home, manifest, marketplace) {
         let _ = runner.run(&install_invocation(manifest, marketplace, cwd));
     }
@@ -382,7 +379,7 @@ mod tests {
 
     #[test]
     fn sync_updates_then_installs_when_missing() {
-        // Not drifted (no known file) → `update`; not installed → `install`.
+        // Not registered → `marketplace add`; not installed → `install`.
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
         let store = tmp.path().join("store");
@@ -396,10 +393,14 @@ mod tests {
             "frontend",
             Path::new("/cwd"),
         );
+        let add_path = store.join("frontend");
         assert_eq!(
             runner.lines(),
             vec![
-                "claude plugin marketplace update frontend".to_string(),
+                format!(
+                    "claude plugin marketplace add {}",
+                    add_path.to_string_lossy()
+                ),
                 "claude plugin install frontend@frontend".to_string(),
             ]
         );
@@ -421,10 +422,13 @@ mod tests {
             "frontend",
             Path::new("/cwd"),
         );
-        // Marketplace refresh only; NO install command.
+        let add_path = store.join("frontend");
         assert_eq!(
             runner.lines(),
-            vec!["claude plugin marketplace update frontend"]
+            vec![format!(
+                "claude plugin marketplace add {}",
+                add_path.to_string_lossy()
+            )]
         );
     }
 

@@ -172,11 +172,11 @@ pub struct HostInstallReport {
     pub skipped: usize,
 }
 
-/// Sequential `pi install <canonical-abs>` for each plugin.
-///
-/// Caller gates PATH. No `Target`, no `-l`/`--trust`. Continues on install
-/// failure. Does not call `is_on_path`.
-pub fn install_pi_packages<R: CommandRunner>(plugins: &[Plugin], runner: &R) -> HostInstallReport {
+pub fn install_pi_packages<R: CommandRunner>(
+    plugins: &[Plugin],
+    store_root: &Path,
+    runner: &R,
+) -> HostInstallReport {
     let mut report = HostInstallReport::default();
     for p in plugins {
         let abs = match std::fs::canonicalize(&p.path) {
@@ -186,8 +186,15 @@ pub fn install_pi_packages<R: CommandRunner>(plugins: &[Plugin], runner: &R) -> 
                 continue;
             }
         };
-        let abs_str = abs.to_string_lossy().into_owned();
-        let inv = Invocation::new("pi", &["install", abs_str.as_str()], &abs);
+        let install_root = crate::host_models::stage_for_host(
+            store_root,
+            &abs,
+            &p.dir_name,
+            crate::host_models::Host::Pi,
+        )
+        .unwrap_or(abs);
+        let abs_str = install_root.to_string_lossy().into_owned();
+        let inv = Invocation::new("pi", &["install", abs_str.as_str()], &install_root);
         report.attempted += 1;
         match runner.run(&inv) {
             Ok(out) if out.success => report.ok += 1,
@@ -365,9 +372,11 @@ mod tests {
     #[test]
     fn pi_install_emits_abs_paths() {
         let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        fs::create_dir_all(&store).unwrap();
         let plugins = vec![temp_plugin("a", tmp.path()), temp_plugin("b", tmp.path())];
         let runner = RecordingRunner::new();
-        let report = install_pi_packages(&plugins, &runner);
+        let report = install_pi_packages(&plugins, &store, &runner);
         assert_eq!(report.ok, 2);
         assert_eq!(report.failed, 0);
         assert_eq!(report.skipped, 0);
@@ -375,27 +384,29 @@ mod tests {
         let calls = runner.calls();
         assert_eq!(calls.len(), 2);
         for (i, p) in plugins.iter().enumerate() {
-            let abs = std::fs::canonicalize(&p.path).unwrap();
+            let staged = crate::host_models::host_stage_dir(&store, crate::host_models::Host::Pi, &p.dir_name);
             assert_eq!(calls[i].program, "pi");
             assert_eq!(
                 calls[i].args,
-                vec!["install".to_string(), abs.to_string_lossy().into_owned()]
+                vec!["install".to_string(), staged.to_string_lossy().into_owned()]
             );
             assert!(Path::new(&calls[i].args[1]).is_absolute());
-            assert_eq!(calls[i].cwd, abs);
+            assert_eq!(calls[i].cwd, staged);
         }
     }
 
     #[test]
     fn pi_install_relative_path_becomes_abs() {
         let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        fs::create_dir_all(&store).unwrap();
         let name = "relplug";
         let abs_dir = tmp.path().join(name);
         fs::create_dir_all(&abs_dir).unwrap();
         let mut p = temp_plugin(name, tmp.path());
         p.path = abs_dir.join(".").join("..").join(name);
         let runner = RecordingRunner::new();
-        let report = install_pi_packages(&[p], &runner);
+        let report = install_pi_packages(&[p], &store, &runner);
         assert_eq!(report.ok, 1);
         assert_eq!(report.skipped, 0);
         let arg = &runner.calls()[0].args[1];
@@ -403,13 +414,15 @@ mod tests {
         assert!(!arg.contains("/./") && !arg.contains("/../"));
         assert_eq!(
             Path::new(arg),
-            std::fs::canonicalize(tmp.path().join(name)).unwrap()
+            crate::host_models::host_stage_dir(&store, crate::host_models::Host::Pi, name)
         );
     }
 
     #[test]
     fn pi_install_skips_missing_path() {
         let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        fs::create_dir_all(&store).unwrap();
         let good = temp_plugin("good", tmp.path());
         let bad = Plugin {
             dir_name: "missing".into(),
@@ -419,17 +432,20 @@ mod tests {
             path: tmp.path().join("does-not-exist"),
         };
         let runner = RecordingRunner::new();
-        let report = install_pi_packages(&[good.clone(), bad], &runner);
+        let report = install_pi_packages(&[good.clone(), bad], &store, &runner);
         assert_eq!(report.skipped, 1);
         assert_eq!(report.ok, 1);
         assert_eq!(report.attempted, 1);
         assert_eq!(runner.calls().len(), 1);
         assert_eq!(
             runner.calls()[0].args[1],
-            std::fs::canonicalize(&good.path)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
+            crate::host_models::host_stage_dir(
+                &store,
+                crate::host_models::Host::Pi,
+                &good.dir_name,
+            )
+            .to_string_lossy()
+            .into_owned()
         );
     }
 
@@ -438,7 +454,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let plugins = vec![temp_plugin("a", tmp.path()), temp_plugin("b", tmp.path())];
         let runner = RecordingRunner::failing(|_| true);
-        let report = install_pi_packages(&plugins, &runner);
+        let report = install_pi_packages(&plugins, tmp.path(), &runner);
         assert_eq!(report.failed, 2);
         assert_eq!(report.attempted, 2);
         assert_eq!(report.ok, 0);
@@ -450,7 +466,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let plugins = vec![temp_plugin("a", tmp.path())];
         let runner = ErrRunner::new();
-        let report = install_pi_packages(&plugins, &runner);
+        let report = install_pi_packages(&plugins, tmp.path(), &runner);
         assert_eq!(report.failed, 1);
         assert_eq!(report.attempted, 1);
         assert_eq!(report.ok, 0);
@@ -460,8 +476,34 @@ mod tests {
     #[test]
     fn pi_install_empty() {
         let runner = RecordingRunner::new();
-        let report = install_pi_packages(&[], &runner);
+        let report = install_pi_packages(&[], Path::new("/no-store"), &runner);
         assert_eq!(report, HostInstallReport::default());
         assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn pi_install_rewrites_agent_models_on_stage() {
+        let tmp = TempDir::new().unwrap();
+        let store = tmp.path().join("store");
+        fs::create_dir_all(&store).unwrap();
+        let p = temp_plugin("lead", tmp.path());
+        fs::create_dir_all(p.path.join("agents")).unwrap();
+        fs::write(
+            p.path.join("agents").join("lead.md"),
+            "---\nmodel: opus\n---\n# Lead\n",
+        )
+        .unwrap();
+        let runner = RecordingRunner::new();
+        let _ = install_pi_packages(std::slice::from_ref(&p), &store, &runner);
+        let staged = crate::host_models::host_stage_dir(
+            &store,
+            crate::host_models::Host::Pi,
+            &p.dir_name,
+        );
+        let staged_text = fs::read_to_string(staged.join("agents").join("lead.md")).unwrap();
+        let src_text = fs::read_to_string(p.path.join("agents").join("lead.md")).unwrap();
+        assert!(staged_text.contains("model: *opus*"));
+        assert!(src_text.contains("model: opus"));
+        assert!(!src_text.contains("*opus*"));
     }
 }

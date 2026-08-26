@@ -1,8 +1,6 @@
 # aip-cli
 
-Enable the right AI plugins, skills, and agents per folder — disable the rest. No uninstalls, no permanent bloat.
-
-Drop a marker file in a project, then run `aip-cli enable` when you want that folder's set on. Nothing auto-switches on `cd`.
+Install every plugin from a folder onto Claude Code, Codex, and Pi; enable them per folder; keep `.aip-removed` plugins off.
 
 ## Why
 
@@ -35,16 +33,21 @@ git clone https://github.com/dan/aip-cli.git && cd aip-cli && make install
 ## Quick start
 
 ```bash
-# in a project: pick plugins — applies now and writes .aip-cli.toml
-aip-cli mode apple backend-go
+# ingest every plugin (skips .aip-removed), install on Claude / Codex / Pi
+aip-cli setup ~/projects/claude/plugins
 
-# later (same or another shell): re-apply this folder's saved plugins
+# enable every store plugin (except .aip-removed) on this folder
+aip-cli mode
+
+# later: re-apply this folder's saved set
 aip-cli enable
+
+# recopy every installed plugin from last source
+aip-cli refresh
 ```
 
-`aip-cli mode` applies the set to every installed agent *and* writes a
-`.aip-cli.toml` marker so you can re-apply with `aip-cli enable`. Pass `--no-save`
-for a one-off apply that leaves no marker.
+`aip-cli mode` with no names enables every store plugin that is not `.aip-removed`.
+Pass names to enable only those. Writes `.aip-cli.toml` unless `--no-save`.
 
 ## Marker file
 

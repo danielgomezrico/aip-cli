@@ -5,13 +5,13 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use aip_core::agent_state::read_state;
 use aip_core::claude_plugins;
 use aip_core::config::{canonicalize_dir, canonicalize_or_self, find_repo_root, MARKER_NAME};
-use aip_core::discovery::{discover_plugins, plugins_root};
+use aip_core::discovery::{discover_plugins, plugins_root, Plugin};
 use aip_core::doctor::{self, AgentInput, ProjectInput, StorePlugin};
 use aip_core::grok_plugins;
 use aip_core::hook::{
@@ -36,8 +36,8 @@ use aip_core::store;
 #[command(
     name = "aip-cli",
     version,
-    about = "Install and switch Claude Code / Grok / Pi plugins per folder.",
-    after_help = "Run with no command to list installed plugins and refresh selected ones from their last source."
+    about = "Install and switch Claude Code / Codex / Grok / Pi plugins per folder.",
+    after_help = "Run with no command to refresh every installed plugin (except .aip-removed) from its last source."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -63,14 +63,13 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Pick plugins by name or 1-based number, apply them now, and remember
-    /// the selection for this folder.
+    /// Enable every store plugin (except `.aip-removed`), or only the named ones.
     ///
-    /// Applies the selected plugins to every installed AI agent, then writes a
+    /// Applies the set to every installed AI agent, then writes a
     /// `.aip-cli.toml` marker so you can re-apply later with `aip-cli enable`.
     /// Pass `--no-save` for a one-off apply that writes no marker.
     Mode {
-        /// Plugin selectors (names or 1-based numbers). Omit for an interactive picker.
+        /// Plugin selectors (names or 1-based numbers). Omit to enable all store plugins.
         selectors: Vec<String>,
         /// Restrict to a single agent (`claude`, `grok`, or `pi`) and pin the
         /// marker to it. Default: all installed agents.
@@ -122,11 +121,11 @@ enum Command {
     },
     /// Recopy plugins from the folder/URL they were last ingested from.
     ///
-    /// Omit names to pick from installed plugins (same as a bare `aip-cli`).
-    /// Simpler than `setup <folder>`: recopies the selected store slots and
-    /// refreshes Claude/Grok. Does not run `make prepare`.
+    /// Omit names to refresh every installed plugin (same as a bare `aip-cli`).
+    /// Skips `.aip-removed`. Simpler than `setup <folder>`: recopies store slots
+    /// and refreshes Claude/Codex/Grok. Does not run `make prepare`.
     Refresh {
-        /// Plugin names or 1-based picker numbers. Omit for an interactive picker.
+        /// Plugin names. Omit to refresh every installed (non-removed) plugin.
         names: Vec<String>,
     },
 }
@@ -257,12 +256,9 @@ fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Re
         println!("  {icon} {:<8} {}", s.phase, s.plugin);
     }
 
-    // Against the store, guarantee each plugin is installed for Claude and
-    // serving the store's latest code: refresh the marketplace (re-register on
-    // installLocation drift, else `marketplace update`), then `plugin install`
-    // it if installed_plugins.json doesn't already list it. Keyed by the plugin's
-    // manifest + marketplace names (not the store dir). Skipped for a source-repo
-    // run (`vendor`): there the marketplace `add` is the plugin's own `make setup`.
+    // Install every plugin on Claude and Codex (marketplace add + plugin install).
+    // Codex/Pi get a staged copy whose agent `model:` uses that host's latest
+    // family alias (`gpt-5.6`, `*opus*`); the store stays Claude-native (`opus`).
     for p in &plugins {
         sync_plugin_hosts(
             &runner,
@@ -271,7 +267,6 @@ fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Re
             &p.dir_name,
             &p.name,
             &p.path,
-            !vendor,
         );
     }
 
@@ -283,7 +278,7 @@ fn cmd_setup(repo: Option<PathBuf>, source: Option<String>, verbose: bool) -> Re
         println!(
             "  note: pi has no plugin disable; all installed package skills load globally until removed"
         );
-        let report = install_pi_packages(&plugins, &runner);
+        let report = install_pi_packages(&plugins, &store_root, &runner);
         println!(
             "  pi: {} ok, {} failed, {} skipped",
             report.ok, report.failed, report.skipped
@@ -304,13 +299,16 @@ fn cmd_mode(
     verbose: bool,
 ) -> Result<()> {
     let selector = if selectors.is_empty() {
-        prompt_for_mode()?
+        let all = modes::all_plugins();
+        if all.is_empty() {
+            return Err(anyhow!("no plugins in the store to enable"));
+        }
+        all.join(" ")
     } else {
         selectors.join(" ")
     };
     let targets = resolve_targets(only.clone())?;
     apply_selector(&selector, &targets, verbose)?;
-    // Persist the marker by default so `aip-cli enable` can re-apply later.
     if !no_save {
         persist_marker(&selector, only, dir)?;
     }
@@ -475,20 +473,6 @@ fn persist_marker(selector: &str, only: Option<String>, dir: PathBuf) -> Result<
     Ok(())
 }
 
-fn prompt_for_mode() -> Result<String> {
-    println!("Plugins (pick one or more):");
-    for line in modes::numbered_plugin_lines() {
-        println!("  {line}");
-    }
-    print!("PLUGINS? (space-separated numbers or names) ");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .context("reading mode selection")?;
-    Ok(line.trim().to_string())
-}
-
 fn display_source(source: &str) -> String {
     if let Some(home) = dirs::home_dir() {
         let home = home.to_string_lossy();
@@ -499,57 +483,6 @@ fn display_source(source: &str) -> String {
     source.to_string()
 }
 
-fn origin_label(dir_name: &str, store_root: &Path, cwd: &Path) -> String {
-    match origins::resolve_origin(dir_name, store_root, cwd) {
-        Some(s) => display_source(&s),
-        None => "—".to_string(),
-    }
-}
-
-fn print_plugin_rows(plugins: &[RemovablePlugin], store_root: &Path, cwd: &Path) {
-    for (i, p) in plugins.iter().enumerate() {
-        let src = origin_label(&p.dir_name, store_root, cwd);
-        if p.manifest != p.dir_name {
-            println!(
-                "  {:>2}) {:<18} ({})  {}  {}",
-                i + 1,
-                p.dir_name,
-                p.version,
-                p.manifest,
-                src
-            );
-        } else {
-            println!(
-                "  {:>2}) {:<18} ({})  {}",
-                i + 1,
-                p.dir_name,
-                p.version,
-                src
-            );
-        }
-    }
-}
-
-fn prompt_for_refresh(
-    plugins: &[RemovablePlugin],
-    store_root: &Path,
-    cwd: &Path,
-) -> Result<Vec<String>> {
-    println!("Plugins (pick one or more to refresh from last source):");
-    print_plugin_rows(plugins, store_root, cwd);
-    print!("REFRESH? (space-separated numbers or names) ");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .context("reading plugin selection")?;
-    match parse_remove_selectors(line.trim(), plugins) {
-        Ok(names) => Ok(names),
-        Err(RemoveSelectError::Empty) => Ok(Vec::new()),
-        Err(e) => Err(anyhow!("{e}")),
-    }
-}
-
 fn sync_plugin_hosts(
     runner: &SystemRunner,
     home: &Path,
@@ -557,12 +490,11 @@ fn sync_plugin_hosts(
     dir_name: &str,
     manifest: &str,
     path: &Path,
-    sync_claude: bool,
 ) {
     if aip_core::is_setup_blocked(path, &store_root.join(dir_name)) {
         return;
     }
-    if sync_claude && is_on_path("claude") {
+    if is_on_path("claude") {
         let marketplace = claude_plugins::resolve_marketplace_name(path, dir_name);
         claude_plugins::sync_installed_plugin(
             runner,
@@ -572,6 +504,11 @@ fn sync_plugin_hosts(
             manifest,
             &marketplace,
             path,
+        );
+    }
+    if is_on_path("codex") {
+        aip_core::codex_plugins::sync_installed_plugin(
+            runner, home, store_root, dir_name, manifest, path, path,
         );
     }
     if is_on_path("grok") {
@@ -591,26 +528,7 @@ fn cmd_refresh(names: Vec<String>, verbose: bool) -> Result<()> {
         return Ok(());
     }
     let names = if names.is_empty() {
-        let any_origin = plugins
-            .iter()
-            .any(|p| origins::resolve_origin(&p.dir_name, &store_root, &cwd).is_some());
-        if !any_origin {
-            println!(
-                "(no last source recorded — run `aip-cli setup <folder>` once, or run from the plugins repo)"
-            );
-        }
-        if !std::io::stdin().is_terminal() {
-            println!("plugins in {}:", store_root.display());
-            print_plugin_rows(&plugins, &store_root, &cwd);
-            println!("refresh: aip-cli refresh <name>...");
-            return Ok(());
-        }
-        let selected = prompt_for_refresh(&plugins, &store_root, &cwd)?;
-        if selected.is_empty() {
-            println!("(nothing selected)");
-            return Ok(());
-        }
-        selected
+        plugins.iter().map(|p| p.dir_name.clone()).collect()
     } else {
         expand_remove_names(&names, &plugins)
     };
@@ -618,7 +536,13 @@ fn cmd_refresh(names: Vec<String>, verbose: bool) -> Result<()> {
     let runner = SystemRunner { verbose };
     let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
     let mut failed = false;
+    let mut any = false;
     for name in &names {
+        if origins::resolve_origin(name, &store_root, &cwd).is_none() {
+            println!("  – {name}: no last source (run `aip-cli setup <folder>` once)");
+            continue;
+        }
+        any = true;
         match refresh_from_origin(name, &store_root, &cwd, &runner) {
             Ok(ingested) => {
                 println!(
@@ -636,14 +560,31 @@ fn cmd_refresh(names: Vec<String>, verbose: bool) -> Result<()> {
                     &ingested.name,
                     &manifest,
                     &ingested.dest,
-                    true,
                 );
+                if is_on_path("pi") {
+                    let _ = install_pi_packages(
+                        &[Plugin {
+                            dir_name: ingested.name.clone(),
+                            name: manifest,
+                            version: String::new(),
+                            has_prepare: false,
+                            path: ingested.dest,
+                        }],
+                        &store_root,
+                        &runner,
+                    );
+                }
             }
             Err(e) => {
                 println!("  ✗ {name}: {e}");
                 failed = true;
             }
         }
+    }
+    if !any && names.iter().all(|n| plugins.iter().any(|p| &p.dir_name == n)) {
+        println!(
+            "(no last source recorded — run `aip-cli setup <folder>` once, or run from the plugins repo)"
+        );
     }
     if failed {
         Err(anyhow!("one or more plugins failed to refresh"))
@@ -905,6 +846,15 @@ mod tests {
     }
 
     #[test]
+    fn mode_without_selectors_means_enable_all() {
+        let cli = Cli::try_parse_from(["aip-cli", "mode"]).unwrap();
+        match cli.command {
+            Some(Command::Mode { selectors, .. }) => assert!(selectors.is_empty()),
+            _ => panic!("expected Mode"),
+        }
+    }
+
+    #[test]
     fn list_help_describes_plugins_not_facet_modes() {
         let err = Cli::try_parse_from(["aip-cli", "list", "--help"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
@@ -920,7 +870,9 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
         let text = err.render().to_string();
         assert!(text.contains("plugin"), "{text}");
+        assert!(text.contains("Omit to enable all"), "{text}");
         assert!(!text.contains("Pick a mode"), "{text}");
+        assert!(!text.contains("interactive picker"), "{text}");
         assert!(!text.contains("mobile"), "{text}");
     }
 

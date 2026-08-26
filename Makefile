@@ -20,7 +20,7 @@ help:
 	@echo "  release       Cut a release (bump + tag + changelog)  [LEVEL=patch|minor|major]"
 	@echo ""
 	@echo "After 'make install':"
-	@echo "  $(BIN) mode <plugin…>   # pick plugins (saves .aip-cli.toml)"
+	@echo "  $(BIN) mode             # enable every store plugin (saves .aip-cli.toml)"
 	@echo "  $(BIN) enable           # re-apply this folder's saved plugins (manual; no auto-on-cd)"
 	@echo "Tab completion:"
 	@echo "  bash:  source <(\$$($(BIN) completion bash))   (or write to ~/.local/share/bash-completion/completions/$(BIN))"

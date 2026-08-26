@@ -14,6 +14,7 @@ pub mod discovery;
 pub mod doctor;
 pub mod grok_plugins;
 pub mod hook;
+pub mod host_models;
 pub mod ingest;
 pub mod manifest;
 pub mod mode_apply;
