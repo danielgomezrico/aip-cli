@@ -177,6 +177,16 @@ pub fn install_pi_packages<R: CommandRunner>(
     store_root: &Path,
     runner: &R,
 ) -> HostInstallReport {
+    let catalog = crate::host_models::PiModelCatalog::detect();
+    install_pi_packages_with_catalog(plugins, store_root, runner, &catalog)
+}
+
+fn install_pi_packages_with_catalog<R: CommandRunner>(
+    plugins: &[Plugin],
+    store_root: &Path,
+    runner: &R,
+    catalog: &crate::host_models::PiModelCatalog,
+) -> HostInstallReport {
     let mut report = HostInstallReport::default();
     for p in plugins {
         let abs = match std::fs::canonicalize(&p.path) {
@@ -186,6 +196,17 @@ pub fn install_pi_packages<R: CommandRunner>(
                 continue;
             }
         };
+        let mut old_sources = vec![abs.clone()];
+        if let Ok(store_source) = std::fs::canonicalize(store_root.join(&p.dir_name)) {
+            if store_source != abs {
+                old_sources.push(store_source);
+            }
+        }
+        for source in old_sources {
+            let source_text = source.to_string_lossy().into_owned();
+            let remove = Invocation::new("pi", &["remove", source_text.as_str()], &source);
+            let _ = runner.run(&remove);
+        }
         let install_root = crate::host_models::stage_for_host(
             store_root,
             &abs,
@@ -193,6 +214,7 @@ pub fn install_pi_packages<R: CommandRunner>(
             crate::host_models::Host::Pi,
         )
         .unwrap_or(abs);
+        crate::host_models::prepare_pi_package(&install_root, catalog);
         let abs_str = install_root.to_string_lossy().into_owned();
         let inv = Invocation::new("pi", &["install", abs_str.as_str()], &install_root);
         report.attempted += 1;
@@ -238,6 +260,24 @@ mod tests {
             has_prepare: false,
             path,
         }
+    }
+
+    fn pi_catalog() -> crate::host_models::PiModelCatalog {
+        crate::host_models::PiModelCatalog::parse(
+            "provider model context max-out thinking images\n\
+             ollama muse-glimmer 131K 8K yes yes\n\
+             ollama qwen3.8-27b 131K 8K no no\n\
+             ollama qwen3-coder:30b 16K 8K no no\n\
+             ollama qwen2.5-coder:7b 16K 8K no no\n",
+        )
+    }
+
+    fn install_for_test<R: CommandRunner>(
+        plugins: &[Plugin],
+        store: &Path,
+        runner: &R,
+    ) -> HostInstallReport {
+        install_pi_packages_with_catalog(plugins, store, runner, &pi_catalog())
     }
 
     /// Returns `Err` for every inv — exercises the `run` error branch.
@@ -370,28 +410,36 @@ mod tests {
     }
 
     #[test]
-    fn pi_install_emits_abs_paths() {
+    fn pi_install_removes_each_source_before_installing_its_host_stage() {
         let tmp = TempDir::new().unwrap();
         let store = tmp.path().join("store");
         fs::create_dir_all(&store).unwrap();
         let plugins = vec![temp_plugin("a", tmp.path()), temp_plugin("b", tmp.path())];
         let runner = RecordingRunner::new();
-        let report = install_pi_packages(&plugins, &store, &runner);
+        let report = install_for_test(&plugins, &store, &runner);
         assert_eq!(report.ok, 2);
         assert_eq!(report.failed, 0);
         assert_eq!(report.skipped, 0);
         assert_eq!(report.attempted, 2);
         let calls = runner.calls();
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 4);
         for (i, p) in plugins.iter().enumerate() {
-            let staged = crate::host_models::host_stage_dir(&store, crate::host_models::Host::Pi, &p.dir_name);
-            assert_eq!(calls[i].program, "pi");
+            let staged = crate::host_models::host_stage_dir(
+                &store,
+                crate::host_models::Host::Pi,
+                &p.dir_name,
+            );
+            let remove = &calls[i * 2];
+            let install = &calls[i * 2 + 1];
+            assert_eq!(remove.args[0], "remove");
+            assert_eq!(Path::new(&remove.args[1]), p.path.canonicalize().unwrap());
+            assert_eq!(install.program, "pi");
             assert_eq!(
-                calls[i].args,
+                install.args,
                 vec!["install".to_string(), staged.to_string_lossy().into_owned()]
             );
-            assert!(Path::new(&calls[i].args[1]).is_absolute());
-            assert_eq!(calls[i].cwd, staged);
+            assert!(Path::new(&install.args[1]).is_absolute());
+            assert_eq!(install.cwd, staged);
         }
     }
 
@@ -406,10 +454,10 @@ mod tests {
         let mut p = temp_plugin(name, tmp.path());
         p.path = abs_dir.join(".").join("..").join(name);
         let runner = RecordingRunner::new();
-        let report = install_pi_packages(&[p], &store, &runner);
+        let report = install_for_test(&[p], &store, &runner);
         assert_eq!(report.ok, 1);
         assert_eq!(report.skipped, 0);
-        let arg = &runner.calls()[0].args[1];
+        let arg = &runner.calls()[1].args[1];
         assert!(Path::new(arg).is_absolute());
         assert!(!arg.contains("/./") && !arg.contains("/../"));
         assert_eq!(
@@ -432,13 +480,13 @@ mod tests {
             path: tmp.path().join("does-not-exist"),
         };
         let runner = RecordingRunner::new();
-        let report = install_pi_packages(&[good.clone(), bad], &store, &runner);
+        let report = install_for_test(&[good.clone(), bad], &store, &runner);
         assert_eq!(report.skipped, 1);
         assert_eq!(report.ok, 1);
         assert_eq!(report.attempted, 1);
-        assert_eq!(runner.calls().len(), 1);
+        assert_eq!(runner.calls().len(), 2);
         assert_eq!(
-            runner.calls()[0].args[1],
+            runner.calls()[1].args[1],
             crate::host_models::host_stage_dir(
                 &store,
                 crate::host_models::Host::Pi,
@@ -454,7 +502,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let plugins = vec![temp_plugin("a", tmp.path()), temp_plugin("b", tmp.path())];
         let runner = RecordingRunner::failing(|_| true);
-        let report = install_pi_packages(&plugins, tmp.path(), &runner);
+        let report = install_for_test(&plugins, tmp.path(), &runner);
         assert_eq!(report.failed, 2);
         assert_eq!(report.attempted, 2);
         assert_eq!(report.ok, 0);
@@ -466,17 +514,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let plugins = vec![temp_plugin("a", tmp.path())];
         let runner = ErrRunner::new();
-        let report = install_pi_packages(&plugins, tmp.path(), &runner);
+        let report = install_for_test(&plugins, tmp.path(), &runner);
         assert_eq!(report.failed, 1);
         assert_eq!(report.attempted, 1);
         assert_eq!(report.ok, 0);
-        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+        assert_eq!(runner.calls.lock().unwrap().len(), 2);
     }
 
     #[test]
     fn pi_install_empty() {
         let runner = RecordingRunner::new();
-        let report = install_pi_packages(&[], Path::new("/no-store"), &runner);
+        let report = install_for_test(&[], Path::new("/no-store"), &runner);
         assert_eq!(report, HostInstallReport::default());
         assert!(runner.calls().is_empty());
     }
@@ -494,15 +542,12 @@ mod tests {
         )
         .unwrap();
         let runner = RecordingRunner::new();
-        let _ = install_pi_packages(std::slice::from_ref(&p), &store, &runner);
-        let staged = crate::host_models::host_stage_dir(
-            &store,
-            crate::host_models::Host::Pi,
-            &p.dir_name,
-        );
+        let _ = install_for_test(std::slice::from_ref(&p), &store, &runner);
+        let staged =
+            crate::host_models::host_stage_dir(&store, crate::host_models::Host::Pi, &p.dir_name);
         let staged_text = fs::read_to_string(staged.join("agents").join("lead.md")).unwrap();
         let src_text = fs::read_to_string(p.path.join("agents").join("lead.md")).unwrap();
-        assert!(staged_text.contains("model: *opus*"));
+        assert!(staged_text.contains("model: ollama/muse-glimmer"));
         assert!(src_text.contains("model: opus"));
         assert!(!src_text.contains("*opus*"));
     }

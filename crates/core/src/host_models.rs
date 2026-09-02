@@ -6,6 +6,7 @@
 //! model). `inherit` is left alone.
 
 use crate::store::copy_dir_all;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Host whose plugin agents need a model rewrite at install time.
@@ -172,6 +173,284 @@ pub fn rewrite_agents_dir(root: &Path, host: Host) {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PiModelCatalog {
+    models: BTreeSet<String>,
+}
+
+impl PiModelCatalog {
+    pub(crate) fn detect() -> Self {
+        std::process::Command::new("pi")
+            .arg("--list-models")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| Self::parse(&String::from_utf8_lossy(&output.stdout)))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn parse(output: &str) -> Self {
+        let models = output
+            .lines()
+            .filter_map(|line| {
+                let mut columns = line.split_whitespace();
+                let provider = columns.next()?;
+                let model = columns.next()?;
+                (provider != "provider").then(|| format!("{provider}/{model}"))
+            })
+            .collect();
+        Self { models }
+    }
+
+    fn first_available<'a>(&self, preferred: &[&'a str]) -> Option<&'a str> {
+        preferred
+            .iter()
+            .copied()
+            .find(|model| self.models.contains(*model))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiAgentRole {
+    Thinking,
+    Programming,
+    Doing,
+    Unknown,
+}
+
+fn pi_agent_role(text: &str) -> PiAgentRole {
+    let frontmatter = text
+        .split("---")
+        .nth(1)
+        .unwrap_or(text)
+        .to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|word| frontmatter.contains(word));
+
+    if has(&[
+        "architect",
+        "review",
+        "critic",
+        "analyst",
+        "investigat",
+        "research",
+        "plan",
+        "design",
+        "audit",
+        "diagnos",
+        "advisor",
+        "strateg",
+        "brainstorm",
+        "grade",
+        "scope",
+    ]) {
+        PiAgentRole::Thinking
+    } else if has(&[
+        "setup",
+        "install",
+        "ship",
+        "release",
+        "static analysis",
+        "format",
+        "lint",
+        "fetch",
+        "gather",
+        "capture",
+        "run",
+        "sync",
+        "update",
+        "migrate",
+        "convert",
+        "generate",
+    ]) {
+        PiAgentRole::Doing
+    } else if has(&[
+        "implement",
+        "developer",
+        "engineer",
+        "code",
+        "coding",
+        "refactor",
+        "tdd",
+        "test",
+        "debug",
+        "fix",
+        "build",
+        "program",
+    ]) {
+        PiAgentRole::Programming
+    } else {
+        PiAgentRole::Unknown
+    }
+}
+
+fn is_mapped_family(model: &str) -> bool {
+    ["opus", "sonnet", "haiku", "fable", "gpt-5"]
+        .iter()
+        .any(|family| model.to_ascii_lowercase().contains(family))
+}
+
+fn pi_agent_model<'a>(
+    catalog: &'a PiModelCatalog,
+    role: PiAgentRole,
+    current: &str,
+) -> Option<&'a str> {
+    let current = current.trim_matches(['\'', '"']);
+    if current.eq_ignore_ascii_case("inherit")
+        || (!current.is_empty() && !is_mapped_family(current))
+    {
+        return None;
+    }
+
+    let high_reasoning = current.contains("opus") || current.contains("fable");
+    match role {
+        PiAgentRole::Thinking if high_reasoning => {
+            catalog.first_available(&["ollama/muse-glimmer", "ollama/qwen3.8-27b"])
+        }
+        PiAgentRole::Thinking => {
+            catalog.first_available(&["ollama/qwen3.8-27b", "ollama/muse-glimmer"])
+        }
+        PiAgentRole::Programming => catalog.first_available(&[
+            "ollama/qwen3-coder:30b",
+            "ollama/qwen2.5-coder:32b",
+            "ollama/qwen2.5-coder:7b",
+        ]),
+        PiAgentRole::Doing => catalog.first_available(&[
+            "ollama/qwen2.5-coder:7b",
+            "ollama/qwen3-coder:30b",
+            "ollama/qwen2.5-coder:32b",
+        ]),
+        PiAgentRole::Unknown if high_reasoning => {
+            catalog.first_available(&["ollama/muse-glimmer", "ollama/qwen3.8-27b"])
+        }
+        PiAgentRole::Unknown if current.contains("sonnet") => {
+            catalog.first_available(&["ollama/qwen3.8-27b", "ollama/muse-glimmer"])
+        }
+        PiAgentRole::Unknown => {
+            catalog.first_available(&["ollama/qwen2.5-coder:7b", "ollama/qwen3-coder:30b"])
+        }
+    }
+}
+
+fn rewrite_pi_agent(text: &str, catalog: &PiModelCatalog) -> Option<String> {
+    let role = pi_agent_role(text);
+    let mut changed = false;
+    let mut in_frontmatter = false;
+    let mut out = String::with_capacity(text.len());
+
+    for (index, line) in text.lines().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        if line.trim() == "---" {
+            in_frontmatter = !in_frontmatter;
+            out.push_str(line);
+            continue;
+        }
+        let (indent, rest) = split_indent(line);
+        let replacement = in_frontmatter
+            .then(|| rest.strip_prefix("model:"))
+            .flatten()
+            .and_then(|value| pi_agent_model(catalog, role, value.trim()));
+        if let Some(model) = replacement {
+            out.push_str(&format!("{indent}model: {model}"));
+            changed |= rest != format!("model: {model}");
+        } else {
+            out.push_str(line);
+        }
+    }
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    changed.then_some(out)
+}
+
+fn yaml_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\t' => quoted.push_str("\\t"),
+            '\r' => quoted.push_str("\\r"),
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn normalize_pi_skill(text: &str) -> Option<String> {
+    let mut changed = false;
+    let mut in_frontmatter = false;
+    let mut out = String::with_capacity(text.len());
+
+    for (index, line) in text.lines().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        if line.trim() == "---" {
+            in_frontmatter = !in_frontmatter;
+            out.push_str(line);
+            continue;
+        }
+        let (indent, rest) = split_indent(line);
+        let value = in_frontmatter
+            .then(|| rest.strip_prefix("description:"))
+            .flatten()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.starts_with(['"', '\'', '|', '>']));
+        if let Some(value) = value {
+            out.push_str(&format!("{indent}description: {}", yaml_quote(value)));
+            changed = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    changed.then_some(out)
+}
+
+fn rewrite_pi_skill_tree(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rewrite_pi_skill_tree(&path);
+        } else if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Some(rewritten) = normalize_pi_skill(&text) {
+                let _ = std::fs::write(path, rewritten);
+            }
+        }
+    }
+}
+
+pub(crate) fn prepare_pi_package(root: &Path, catalog: &PiModelCatalog) {
+    let agents = root.join("agents");
+    if let Ok(entries) = std::fs::read_dir(agents) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Some(rewritten) = rewrite_pi_agent(&text, catalog) {
+                let _ = std::fs::write(path, rewritten);
+            }
+        }
+    }
+    rewrite_pi_skill_tree(&root.join("skills"));
+}
+
 /// Host-local staged copy of a store plugin: `<store>/.hosts/<host>/<dir_name>`.
 pub fn host_stage_dir(store_root: &Path, host: Host, dir_name: &str) -> PathBuf {
     let host_dir = match host {
@@ -184,7 +463,12 @@ pub fn host_stage_dir(store_root: &Path, host: Host, dir_name: &str) -> PathBuf 
 
 /// Copy `src` into the host stage and rewrite agent models. Returns the stage
 /// path. `None` when the copy fails (caller should fall back to `src`).
-pub fn stage_for_host(store_root: &Path, src: &Path, dir_name: &str, host: Host) -> Option<PathBuf> {
+pub fn stage_for_host(
+    store_root: &Path,
+    src: &Path,
+    dir_name: &str,
+    host: Host,
+) -> Option<PathBuf> {
     let dest = host_stage_dir(store_root, host, dir_name);
     if dest.exists() {
         let _ = std::fs::remove_dir_all(&dest);
@@ -282,5 +566,64 @@ mod tests {
         assert!(staged.contains("model: gpt-5.6"));
         assert!(original.contains("model: opus"));
         assert!(!original.contains("gpt-5.6"));
+    }
+
+    fn pi_catalog() -> PiModelCatalog {
+        PiModelCatalog::parse(
+            "provider model context max-out thinking images\n\
+             ollama muse-glimmer 131K 8K yes yes\n\
+             ollama qwen3.8-27b 131K 8K no no\n\
+             ollama qwen3-coder:30b 16K 8K no no\n\
+             ollama qwen2.5-coder:7b 16K 8K no no\n",
+        )
+    }
+
+    #[test]
+    fn pi_thinking_agents_prefer_muse_then_qwen38_by_reasoning_tier() {
+        let high = "---\nname: plan-critic\ndescription: Reviews plans\nmodel: *opus*\n---\n";
+        let normal =
+            "---\nname: investigator\ndescription: Investigates facts\nmodel: *sonnet*\n---\n";
+        assert!(rewrite_pi_agent(high, &pi_catalog())
+            .unwrap()
+            .contains("model: ollama/muse-glimmer"));
+        assert!(rewrite_pi_agent(normal, &pi_catalog())
+            .unwrap()
+            .contains("model: ollama/qwen3.8-27b"));
+    }
+
+    #[test]
+    fn pi_programming_and_doing_agents_use_available_code_models() {
+        let programming =
+            "---\nname: rust-developer\ndescription: Implements Rust code\nmodel: *sonnet*\n---\n";
+        let doing = "---\nname: static-analysis\ndescription: Runs lint\nmodel: *haiku*\n---\n";
+        assert!(rewrite_pi_agent(programming, &pi_catalog())
+            .unwrap()
+            .contains("model: ollama/qwen3-coder:30b"));
+        assert!(rewrite_pi_agent(doing, &pi_catalog())
+            .unwrap()
+            .contains("model: ollama/qwen2.5-coder:7b"));
+    }
+
+    #[test]
+    fn pi_keeps_existing_alias_when_preferred_models_are_unavailable() {
+        let agent = "---\nname: plan-critic\ndescription: Reviews plans\nmodel: *opus*\n---\n";
+        assert_eq!(rewrite_pi_agent(agent, &PiModelCatalog::default()), None);
+    }
+
+    #[test]
+    fn pi_skill_descriptions_are_quoted_without_changing_the_source() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let staged = tmp.path().join("staged");
+        std::fs::create_dir_all(source.join("skills").join("nested")).unwrap();
+        let skill = source.join("skills").join("nested").join("SKILL.md");
+        let text =
+            "---\nname: nested\ndescription: Use when task: details include colon\n---\n# Skill\n";
+        std::fs::write(&skill, text).unwrap();
+        copy_dir_all(&source, &staged).unwrap();
+        prepare_pi_package(&staged, &pi_catalog());
+        let rewritten = std::fs::read_to_string(staged.join("skills/nested/SKILL.md")).unwrap();
+        assert!(rewritten.contains("description: \"Use when task: details include colon\""));
+        assert_eq!(std::fs::read_to_string(skill).unwrap(), text);
     }
 }
