@@ -19,7 +19,10 @@ pub enum Host {
 /// Latest-in-family alias for `host`.
 ///
 /// Claude: family names (`opus`, `sonnet`, `haiku`, `fable`) already track the
-/// newest model. Codex: `gpt-5.6` is the documented family alias. Pi: glob
+/// newest model. Codex: `gpt-5.6` is the documented family alias — OpenAI
+/// routes it to the flagship tier (`gpt-5.6-sol` today), so it follows the
+/// family forward and must never be pinned to a tier suffix. `terra` / `luna`
+/// have no alias of their own, so those two are named directly. Pi: glob
 /// `*opus*` / `*sonnet*` / `*haiku*` / `*fable*` matches whatever the user's
 /// providers currently expose.
 pub fn latest_alias(host: Host, model: &str) -> String {
@@ -205,11 +208,32 @@ mod tests {
     }
 
     #[test]
-    fn codex_maps_families_to_gpt56() {
-        assert_eq!(latest_alias(Host::Codex, "opus"), "gpt-5.6");
-        assert_eq!(latest_alias(Host::Codex, "fable"), "gpt-5.6");
+    fn codex_maps_quality_first_families_to_the_gpt56_alias_not_a_pinned_tier() {
+        for model in ["opus", "claude-opus-4-8", "fable", "claude-fable-5"] {
+            assert_eq!(latest_alias(Host::Codex, model), "gpt-5.6");
+        }
+    }
+
+    #[test]
+    fn codex_never_pins_a_tier_suffix_that_a_family_update_could_move() {
+        for model in ["opus", "fable", "gpt-5.6", "o3", "mystery"] {
+            assert!(!latest_alias(Host::Codex, model).contains("-sol"));
+        }
+    }
+
+    #[test]
+    fn codex_names_terra_and_luna_directly_because_neither_has_an_alias() {
         assert_eq!(latest_alias(Host::Codex, "sonnet"), "gpt-5.6-terra");
         assert_eq!(latest_alias(Host::Codex, "haiku"), "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn codex_falls_back_to_the_family_alias_for_unknown_models() {
+        assert_eq!(latest_alias(Host::Codex, "mystery-model"), "gpt-5.6");
+    }
+
+    #[test]
+    fn codex_leaves_inherit_alone() {
         assert_eq!(latest_alias(Host::Codex, "inherit"), "inherit");
     }
 
