@@ -184,18 +184,13 @@ pub fn sync_installed_plugin<R: CommandRunner + ?Sized>(
     let cwd = plugin_path;
     let install_root = store_root.join(dir_name);
     let known = read_known_marketplaces(home);
-    let needs_add = match known.get(marketplace) {
-        Some(loc) => !install_location_into_store(loc, store_root),
-        None => true,
-    };
-    if needs_add {
-        if known.contains_key(marketplace) {
-            let _ = runner.run(&marketplace_remove_invocation(marketplace, cwd));
-        }
-        let _ = runner.run(&marketplace_add_invocation(&install_root, cwd));
-    } else {
-        let _ = runner.run(&marketplace_update_invocation(marketplace, cwd));
+    // Always re-register the marketplace from the current store slot.
+    // This forces Claude to re-scan the directory for the latest skills/agents
+    // after a store refresh or setup. Update alone may not refresh file content.
+    if known.contains_key(marketplace) {
+        let _ = runner.run(&marketplace_remove_invocation(marketplace, cwd));
     }
+    let _ = runner.run(&marketplace_add_invocation(&install_root, cwd));
 
     if !is_installed(home, manifest, marketplace) {
         let _ = runner.run(&install_invocation(manifest, marketplace, cwd));
@@ -482,9 +477,11 @@ mod tests {
             "frontend",
             Path::new("/cwd"),
         );
-        assert_eq!(
-            runner.lines(),
-            vec!["claude plugin marketplace update frontend"]
-        );
+        // Always remove+add so Claude rescans the store dir for latest skills/agents.
+        let lines = runner.lines();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("claude plugin marketplace remove "));
+        assert!(lines[1].starts_with("claude plugin marketplace add "));
+        assert!(lines[1].contains("frontend"));
     }
 }

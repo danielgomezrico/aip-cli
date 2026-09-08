@@ -152,25 +152,31 @@ pub fn rewrite_frontmatter(text: &str, host: Host) -> Option<String> {
     changed.then_some(out)
 }
 
-/// Recursively rewrite `model:` in every `agents/*.md` under `root`.
-/// Best-effort: unreadable files are skipped.
 pub fn rewrite_agents_dir(root: &Path, host: Host) {
-    let agents = root.join("agents");
-    let Ok(rd) = std::fs::read_dir(&agents) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("md") {
-            continue;
+    walk_agent_mds(root, |p| {
+        if let Ok(text) = std::fs::read_to_string(p) {
+            if let Some(rw) = rewrite_frontmatter(&text, host) {
+                let _ = std::fs::write(p, rw);
+            }
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Some(rewritten) = rewrite_frontmatter(&text, host) {
-            let _ = std::fs::write(&path, rewritten);
+    });
+}
+
+fn walk_agent_mds(root: &Path, mut f: impl FnMut(&Path)) {
+    let agents = root.join("agents");
+    fn rec(dir: &Path, f: &mut dyn FnMut(&Path)) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    rec(&p, f);
+                } else if p.extension().and_then(|s| s.to_str()) == Some("md") {
+                    f(&p);
+                }
+            }
         }
     }
+    rec(&agents, &mut f);
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -510,21 +516,13 @@ fn rewrite_pi_skill_tree(root: &Path, plugin_name: &str) {
 }
 
 pub(crate) fn prepare_pi_package(root: &Path, plugin_name: &str, catalog: &PiModelCatalog) {
-    let agents = root.join("agents");
-    if let Ok(entries) = std::fs::read_dir(agents) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            if let Some(rewritten) = rewrite_pi_agent(&text, catalog) {
-                let _ = std::fs::write(path, rewritten);
+    walk_agent_mds(root, |p| {
+        if let Ok(text) = std::fs::read_to_string(p) {
+            if let Some(rw) = rewrite_pi_agent(&text, catalog) {
+                let _ = std::fs::write(p, rw);
             }
         }
-    }
+    });
     rewrite_pi_skill_tree(&root.join("skills"), plugin_name);
 }
 
