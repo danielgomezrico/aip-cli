@@ -181,7 +181,7 @@ pub(crate) struct PiModelCatalog {
 impl PiModelCatalog {
     pub(crate) fn detect() -> Self {
         std::process::Command::new("pi")
-            .arg("--list-models")
+            .args(pi_model_list_args())
             .output()
             .ok()
             .filter(|output| output.status.success())
@@ -208,6 +208,17 @@ impl PiModelCatalog {
             .copied()
             .find(|model| self.models.contains(*model))
     }
+}
+
+fn pi_model_list_args() -> [&'static str; 6] {
+    [
+        "--no-skills",
+        "--no-extensions",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--no-context-files",
+        "--list-models",
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,10 +391,61 @@ fn yaml_quote(value: &str) -> String {
     quoted
 }
 
-fn normalize_pi_skill(text: &str) -> Option<String> {
+fn pi_name_part(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch);
+        } else if !normalized.ends_with('-') {
+            normalized.push('-');
+        }
+    }
+    normalized.trim_matches('-').to_string()
+}
+
+fn stable_name_hash(value: &str) -> u32 {
+    value.bytes().fold(2_166_136_261_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    })
+}
+
+fn pi_skill_name(plugin: &str, skill: &str) -> String {
+    let plugin = pi_name_part(plugin);
+    let skill = pi_name_part(skill);
+    let plugin = if plugin.is_empty() { "plugin" } else { &plugin };
+    let skill = if skill.is_empty() { "skill" } else { &skill };
+    let scoped = if skill == plugin || skill.starts_with(&format!("{plugin}-")) {
+        skill.to_string()
+    } else {
+        format!("{plugin}-{skill}")
+    };
+    if scoped.len() <= 64 {
+        return scoped;
+    }
+    let suffix = format!("-{:08x}", stable_name_hash(&scoped));
+    let keep = 64 - suffix.len();
+    let mut prefix = scoped[..keep].trim_end_matches('-').to_string();
+    prefix.push_str(&suffix);
+    prefix
+}
+
+fn frontmatter_name(text: &str) -> Option<&str> {
+    text.split("---")
+        .nth(1)?
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("name:"))
+        .map(str::trim)
+        .map(|name| name.trim_matches(['\'', '"']))
+        .filter(|name| !name.is_empty())
+}
+
+fn normalize_pi_skill(text: &str, plugin_name: &str, default_skill_name: &str) -> Option<String> {
     let mut changed = false;
     let mut in_frontmatter = false;
     let mut out = String::with_capacity(text.len());
+    let declared_name = frontmatter_name(text).unwrap_or(default_skill_name);
+    let scoped_name = pi_skill_name(plugin_name, declared_name);
+    let has_name = frontmatter_name(text).is_some();
 
     for (index, line) in text.lines().enumerate() {
         if index > 0 {
@@ -392,9 +454,19 @@ fn normalize_pi_skill(text: &str) -> Option<String> {
         if line.trim() == "---" {
             in_frontmatter = !in_frontmatter;
             out.push_str(line);
+            if in_frontmatter && !has_name {
+                out.push_str(&format!("\nname: {scoped_name}"));
+                changed = true;
+            }
             continue;
         }
         let (indent, rest) = split_indent(line);
+        if in_frontmatter && rest.strip_prefix("name:").is_some() {
+            let replacement = format!("{indent}name: {scoped_name}");
+            changed |= replacement != line;
+            out.push_str(&replacement);
+            continue;
+        }
         let value = in_frontmatter
             .then(|| rest.strip_prefix("description:"))
             .flatten()
@@ -413,26 +485,31 @@ fn normalize_pi_skill(text: &str) -> Option<String> {
     changed.then_some(out)
 }
 
-fn rewrite_pi_skill_tree(root: &Path) {
+fn rewrite_pi_skill_tree(root: &Path, plugin_name: &str) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            rewrite_pi_skill_tree(&path);
+            rewrite_pi_skill_tree(&path, plugin_name);
         } else if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if let Some(rewritten) = normalize_pi_skill(&text) {
+            let default_skill_name = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .unwrap_or("skill");
+            if let Some(rewritten) = normalize_pi_skill(&text, plugin_name, default_skill_name) {
                 let _ = std::fs::write(path, rewritten);
             }
         }
     }
 }
 
-pub(crate) fn prepare_pi_package(root: &Path, catalog: &PiModelCatalog) {
+pub(crate) fn prepare_pi_package(root: &Path, plugin_name: &str, catalog: &PiModelCatalog) {
     let agents = root.join("agents");
     if let Ok(entries) = std::fs::read_dir(agents) {
         for entry in entries.flatten() {
@@ -448,7 +525,7 @@ pub(crate) fn prepare_pi_package(root: &Path, catalog: &PiModelCatalog) {
             }
         }
     }
-    rewrite_pi_skill_tree(&root.join("skills"));
+    rewrite_pi_skill_tree(&root.join("skills"), plugin_name);
 }
 
 /// Host-local staged copy of a store plugin: `<store>/.hosts/<host>/<dir_name>`.
@@ -579,6 +656,21 @@ mod tests {
     }
 
     #[test]
+    fn pi_model_listing_disables_all_project_resources() {
+        assert_eq!(
+            pi_model_list_args(),
+            [
+                "--no-skills",
+                "--no-extensions",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--no-context-files",
+                "--list-models",
+            ]
+        );
+    }
+
+    #[test]
     fn pi_thinking_agents_prefer_muse_then_qwen38_by_reasoning_tier() {
         let high = "---\nname: plan-critic\ndescription: Reviews plans\nmodel: *opus*\n---\n";
         let normal =
@@ -621,9 +713,38 @@ mod tests {
             "---\nname: nested\ndescription: Use when task: details include colon\n---\n# Skill\n";
         std::fs::write(&skill, text).unwrap();
         copy_dir_all(&source, &staged).unwrap();
-        prepare_pi_package(&staged, &pi_catalog());
+        prepare_pi_package(&staged, "investigation", &pi_catalog());
         let rewritten = std::fs::read_to_string(staged.join("skills/nested/SKILL.md")).unwrap();
+        assert!(rewritten.contains("name: investigation-nested"));
         assert!(rewritten.contains("description: \"Use when task: details include colon\""));
         assert_eq!(std::fs::read_to_string(skill).unwrap(), text);
+    }
+
+    #[test]
+    fn pi_scopes_same_named_skills_to_every_plugin() {
+        let skill = "---\nname: code-critic\ndescription: Reviews code\n---\n";
+        let flutter = normalize_pi_skill(skill, "flutter", "code-critic").unwrap();
+        let frontend = normalize_pi_skill(skill, "frontend", "code-critic").unwrap();
+        let native = normalize_pi_skill(skill, "frontend-native", "code-critic").unwrap();
+        assert!(flutter.contains("name: flutter-code-critic"));
+        assert!(frontend.contains("name: frontend-code-critic"));
+        assert!(native.contains("name: frontend-native-code-critic"));
+    }
+
+    #[test]
+    fn pi_scopes_skills_without_declared_names() {
+        let skill = "---\ndescription: Reviews code\n---\n";
+        let rewritten = normalize_pi_skill(skill, "frontend", "code-critic").unwrap();
+        assert!(rewritten.starts_with("---\nname: frontend-code-critic\n"));
+    }
+
+    #[test]
+    fn pi_scoped_skill_names_stay_stable_and_within_the_standard_limit() {
+        let plugin = "very-long-plugin-name-that-consumes-most-of-the-name-budget";
+        let skill = "another-very-long-skill-name-that-would-overflow-the-limit";
+        let first = pi_skill_name(plugin, skill);
+        assert_eq!(first, pi_skill_name(plugin, skill));
+        assert!(first.len() <= 64);
+        assert!(first.starts_with("very-long-plugin"));
     }
 }

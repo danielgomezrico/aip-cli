@@ -214,7 +214,7 @@ fn install_pi_packages_with_catalog<R: CommandRunner>(
             crate::host_models::Host::Pi,
         )
         .unwrap_or(abs);
-        crate::host_models::prepare_pi_package(&install_root, catalog);
+        crate::host_models::prepare_pi_package(&install_root, &p.dir_name, catalog);
         let abs_str = install_root.to_string_lossy().into_owned();
         let inv = Invocation::new("pi", &["install", abs_str.as_str()], &install_root);
         report.attempted += 1;
