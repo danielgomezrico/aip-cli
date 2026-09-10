@@ -6,7 +6,9 @@
 //! model). `inherit` is left alone.
 
 use crate::store::copy_dir_all;
+use serde_json::{Map, Value};
 use std::collections::BTreeSet;
+use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 
 /// Host whose plugin agents need a model rewrite at install time.
@@ -536,8 +538,41 @@ pub fn host_stage_dir(store_root: &Path, host: Host, dir_name: &str) -> PathBuf 
     store_root.join(".hosts").join(host_dir).join(dir_name)
 }
 
-/// Copy `src` into the host stage and rewrite agent models. Returns the stage
-/// path. `None` when the copy fails (caller should fall back to `src`).
+fn add_codex_component(manifest: &mut Map<String, Value>, root: &Path, key: &str, relative: &str) {
+    if !manifest.contains_key(key) && root.join(relative).exists() {
+        manifest.insert(key.to_string(), Value::String(format!("./{relative}")));
+    }
+}
+
+fn prepare_codex_manifest(root: &Path) -> std::io::Result<()> {
+    let target = root.join(".codex-plugin").join("plugin.json");
+    if target.is_file() {
+        return Ok(());
+    }
+
+    let source = root.join(".claude-plugin").join("plugin.json");
+    let bytes = match std::fs::read(&source) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut manifest: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+    let object = manifest
+        .as_object_mut()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "plugin manifest is not an object"))?;
+
+    add_codex_component(object, root, "skills", "skills/");
+    add_codex_component(object, root, "agents", "agents/");
+    add_codex_component(object, root, "hooks", "hooks/hooks.json");
+    add_codex_component(object, root, "mcpServers", ".mcp.json");
+
+    let mut rendered = serde_json::to_vec_pretty(&manifest).map_err(Error::other)?;
+    rendered.push(b'\n');
+    std::fs::create_dir_all(target.parent().expect("Codex manifest has a parent"))?;
+    std::fs::write(target, rendered)
+}
+
 pub fn stage_for_host(
     store_root: &Path,
     src: &Path,
@@ -550,12 +585,16 @@ pub fn stage_for_host(
     }
     copy_dir_all(src, &dest).ok()?;
     rewrite_agents_dir(&dest, host);
+    if host == Host::Codex {
+        prepare_codex_manifest(&dest).ok()?;
+    }
     Some(dest)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::TempDir;
 
     #[test]
@@ -641,6 +680,169 @@ mod tests {
         assert!(staged.contains("model: gpt-5.6"));
         assert!(original.contains("model: opus"));
         assert!(!original.contains("gpt-5.6"));
+    }
+
+    #[test]
+    fn codex_stage_preserves_every_non_model_agent_field_in_the_local_corpus() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(src.join("agents")).unwrap();
+        std::fs::write(
+            src.join(".claude-plugin/plugin.json"),
+            r#"{"name":"complete","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let agent = "---\nname: reviewer\ndescription: Review code\nmodel: opus\ncolor: blue\ntools: Read, Glob, Grep, Bash, mcp__gitnexus__*\ndisallowedTools: Agent, mcp__gitnexus__rename\nskills:\n  - review\nmaxTurns: 40\neffort: high\nisolation: worktree\n---\nReview the change.\n";
+        std::fs::write(src.join("agents/reviewer.md"), agent).unwrap();
+
+        let dest = stage_for_host(tmp.path(), &src, "complete", Host::Codex).unwrap();
+        let staged = std::fs::read_to_string(dest.join("agents/reviewer.md")).unwrap();
+
+        assert_eq!(staged, agent.replace("model: opus", "model: gpt-5.6"));
+    }
+
+    #[test]
+    fn codex_stage_declares_every_conventional_plugin_component() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(src.join("skills").join("review")).unwrap();
+        std::fs::create_dir_all(src.join("agents")).unwrap();
+        std::fs::create_dir_all(src.join("hooks")).unwrap();
+        std::fs::write(
+            src.join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"complete","version":"1.2.3","custom":{"kept":true}}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("skills/review/SKILL.md"), "# Review\n").unwrap();
+        std::fs::write(src.join("agents/reviewer.md"), "---\nmodel: opus\n---\n").unwrap();
+        std::fs::write(src.join("hooks/hooks.json"), "{\"hooks\":{}}\n").unwrap();
+        std::fs::write(src.join(".mcp.json"), "{\"mcpServers\":{}}\n").unwrap();
+
+        let dest = stage_for_host(tmp.path(), &src, "complete", Host::Codex).unwrap();
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(dest.join(".codex-plugin/plugin.json")).unwrap())
+                .unwrap();
+
+        assert_eq!(manifest["name"], "complete");
+        assert_eq!(manifest["version"], "1.2.3");
+        assert_eq!(manifest["custom"]["kept"], true);
+        assert_eq!(manifest["skills"], "./skills/");
+        assert_eq!(manifest["agents"], "./agents/");
+        assert_eq!(manifest["hooks"], "./hooks/hooks.json");
+        assert_eq!(manifest["mcpServers"], "./.mcp.json");
+    }
+
+    #[test]
+    fn generated_manifest_installs_and_exposes_its_skill_in_the_real_codex() {
+        if Command::new("codex").arg("--version").output().is_err() {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(src.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(src.join("skills").join("live-check")).unwrap();
+        std::fs::create_dir_all(src.join("agents")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            src.join(".claude-plugin/marketplace.json"),
+            r#"{"name":"aip-live","plugins":[{"name":"aip-live","source":"./"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join(".claude-plugin/plugin.json"),
+            r#"{"name":"aip-live","version":"1.0.0","description":"Live contract"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("skills/live-check/SKILL.md"),
+            "---\nname: aip-live-check\ndescription: Unique live Codex compatibility check.\n---\n\nReturn live.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("agents/reviewer.md"),
+            "---\nname: reviewer\ndescription: Review live compatibility.\nmodel: inherit\nskills:\n  - live-check\n---\n\nReview live compatibility.\n",
+        )
+        .unwrap();
+
+        let staged = stage_for_host(tmp.path(), &src, "aip-live", Host::Codex).unwrap();
+        let run = |args: &[&str]| {
+            Command::new("codex")
+                .args(args)
+                .env("CODEX_HOME", &home)
+                .env("HOME", &home)
+                .output()
+                .unwrap()
+        };
+
+        let marketplace = run(&[
+            "plugin",
+            "marketplace",
+            "add",
+            staged.to_str().unwrap(),
+            "--json",
+        ]);
+        assert!(
+            marketplace.status.success(),
+            "{}",
+            String::from_utf8_lossy(&marketplace.stderr)
+        );
+        let install = run(&["plugin", "add", "aip-live@aip-live", "--json"]);
+        assert!(
+            install.status.success(),
+            "{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+
+        let prompt = run(&["debug", "prompt-input"]);
+        assert!(
+            prompt.status.success(),
+            "{}",
+            String::from_utf8_lossy(&prompt.stderr)
+        );
+        assert!(String::from_utf8_lossy(&prompt.stdout).contains("aip-live-check"));
+    }
+
+    #[test]
+    fn codex_stage_preserves_an_explicit_codex_manifest_byte_for_byte() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(src.join(".codex-plugin")).unwrap();
+        std::fs::create_dir_all(src.join("agents")).unwrap();
+        std::fs::write(
+            src.join(".claude-plugin/plugin.json"),
+            r#"{"name":"source","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let explicit = b"{\n  \"name\": \"codex-source\",\n  \"skills\": \"./custom/\"\n}\n";
+        std::fs::write(src.join(".codex-plugin/plugin.json"), explicit).unwrap();
+
+        let dest = stage_for_host(tmp.path(), &src, "source", Host::Codex).unwrap();
+
+        assert_eq!(
+            std::fs::read(dest.join(".codex-plugin/plugin.json")).unwrap(),
+            explicit
+        );
+    }
+
+    #[test]
+    fn pi_stage_does_not_create_a_codex_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join(".claude-plugin")).unwrap();
+        std::fs::write(
+            src.join(".claude-plugin/plugin.json"),
+            r#"{"name":"source","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let dest = stage_for_host(tmp.path(), &src, "source", Host::Pi).unwrap();
+
+        assert!(!dest.join(".codex-plugin/plugin.json").exists());
     }
 
     fn pi_catalog() -> PiModelCatalog {

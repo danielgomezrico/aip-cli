@@ -58,8 +58,6 @@ struct MarketplaceName {
 struct CodexConfig {
     #[serde(default)]
     marketplaces: BTreeMap<String, MarketplaceSource>,
-    #[serde(default)]
-    plugins: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -91,13 +89,6 @@ pub fn source_into_store(source: &str, store_root: &Path, dir_name: &str) -> boo
     ))
 }
 
-fn is_installed(home: &Path, plugin: &str, marketplace: &str) -> bool {
-    let key = format!("{plugin}@{marketplace}");
-    read_codex_config(home).plugins.contains_key(&key)
-}
-
-/// Stage a Codex copy (rewritten models), register the marketplace, then
-/// `plugin add` if missing. Best-effort.
 pub fn sync_installed_plugin<R: CommandRunner + ?Sized>(
     runner: &R,
     home: &Path,
@@ -123,9 +114,7 @@ pub fn sync_installed_plugin<R: CommandRunner + ?Sized>(
         let _ = runner.run(&marketplace_add_invocation(&install_root, cwd));
     }
 
-    if !is_installed(home, manifest, &marketplace) {
-        let _ = runner.run(&add_invocation(manifest, &marketplace, cwd));
-    }
+    let _ = runner.run(&add_invocation(manifest, &marketplace, cwd));
 }
 
 /// Used by tests that need a known stage path.
@@ -150,7 +139,9 @@ mod tests {
         std::fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
         std::fs::write(
             dir.join(".claude-plugin").join("marketplace.json"),
-            format!(r#"{{"name":"{marketplace}","plugins":[{{"name":"{manifest}","source":"./"}}]}}"#),
+            format!(
+                r#"{{"name":"{marketplace}","plugins":[{{"name":"{manifest}","source":"./"}}]}}"#
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -249,7 +240,7 @@ source = "/old/source/plugins/flutter"
     }
 
     #[test]
-    fn sync_skips_add_when_already_installed_and_source_in_store() {
+    fn sync_readds_an_installed_plugin_so_stage_changes_reach_the_codex_cache() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
         let store = tmp.path().join("store");
@@ -279,7 +270,10 @@ enabled = true
             &src,
             Path::new("/cwd"),
         );
-        assert!(runner.lines().is_empty());
+        assert_eq!(
+            runner.lines(),
+            vec!["codex plugin add frontend@frontend".to_string()]
+        );
     }
 
     #[test]
@@ -301,4 +295,3 @@ enabled = true
         assert_eq!(resolve_codex_marketplace_name(&dir, "plug"), "codex-mkt");
     }
 }
-
