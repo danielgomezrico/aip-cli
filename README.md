@@ -21,7 +21,7 @@ aip-cli keeps everything installed but only activates what you explicitly enable
 - Put a `.aip-cli.toml` in a project folder (or let `aip-cli mode` write one).
 - Run `aip-cli enable` to apply those plugins: `claude`/`grok plugin enable|disable`, and `pi install|remove` for the right set.
 - Nothing runs on `cd`. Plugins only change when you run `mode` or `enable`.
-- Codex gets a private stage for each plugin. An explicit `.codex-plugin/plugin.json` stays byte-for-byte. Otherwise, aip-cli converts the Claude manifest and declares every conventional `skills/`, `agents/`, `hooks/hooks.json`, and `.mcp.json` component. It preserves agent fields, changes only Claude model aliases, and re-adds the plugin on refresh so the Codex cache receives every change. Source plugins stay unchanged.
+- Codex gets a private stage for each plugin. An explicit `.codex-plugin/plugin.json` stays byte-for-byte. Otherwise, aip-cli converts the Claude manifest and declares conventional skills, hooks, and MCP components. Claude `agents/*.md` become native `~/.codex/agents/*.toml` files with Codex model/effort settings and required instructions. Refresh and removal replace only aip-cli-owned agent files. Source plugins stay unchanged.
 
 ## Install
 
