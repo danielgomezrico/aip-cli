@@ -5,7 +5,7 @@
 //! from the aip-cli store.
 
 use crate::claude_plugins::{resolve_marketplace_name, uninstall_invocation};
-use crate::codex_plugins::remove_invocation;
+use crate::codex_plugins::{remove_invocation, remove_registered_agents};
 use crate::config::find_repo_root;
 use crate::discovery::plugins_root;
 use crate::manifest::PluginManifest;
@@ -354,6 +354,26 @@ where
     }
 }
 
+pub fn remove_from_hosts_and_registered_agents<R, F>(
+    runner: &R,
+    exists: F,
+    name: &str,
+    store_root: &Path,
+    cwd: &Path,
+    home: &Path,
+) -> RemoveReport
+where
+    R: CommandRunner + ?Sized,
+    F: Fn(&str) -> bool,
+{
+    let dir_name = find_plugin_dir(name, store_root)
+        .map(|dir| file_name(&dir).to_string())
+        .unwrap_or_else(|| lookup_token(name).to_string());
+    let report = remove_from_hosts(runner, exists, name, store_root, cwd);
+    let _ = remove_registered_agents(home, &dir_name);
+    report
+}
+
 pub fn no_hosts_attempted(report: &RemoveReport) -> bool {
     report.attempts.is_empty()
 }
@@ -471,6 +491,46 @@ mod tests {
         assert!(!report.attempts[0].success);
         assert!(report.attempts[1].success);
         assert!(!no_hosts_attempted(&report));
+    }
+
+    #[test]
+    fn remove_with_codex_agents_reaches_owned_agent_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let store = tmp.path().join("store");
+        write_store_plugin(&store, "flutter", "flutter", Some("flutter"));
+        let plugin = store.join("flutter");
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        std::fs::write(
+            plugin.join("agents/lead.md"),
+            "---\nname: lead\ndescription: Leads\n---\nLead work.\n",
+        )
+        .unwrap();
+        crate::codex_plugins::sync_registered_agents(&home, "flutter", &plugin).unwrap();
+        let user = home.join(".codex/agents/user.toml");
+        std::fs::write(
+            &user,
+            "name = \"user\"\ndescription = \"User\"\ndeveloper_instructions = \"Stay\"\n",
+        )
+        .unwrap();
+
+        let report = remove_from_hosts_and_registered_agents(
+            &RecordingRunner::new(),
+            both_on_path,
+            "flutter",
+            &store,
+            Path::new("/cwd"),
+            &home,
+        );
+
+        assert_eq!(report.spec, "flutter@flutter");
+        assert_eq!(
+            std::fs::read_dir(home.join(".codex/agents"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(user.exists());
     }
 
     #[test]
