@@ -25,8 +25,8 @@ use aip_core::modes::{self, resolve};
 use aip_core::origins;
 use aip_core::remove::{
     expand_remove_names, list_removable, list_removable_for_remove, no_hosts_attempted,
-    parse_remove_selectors, remove_from_hosts, RemovablePlugin, RemoveReport, RemoveSelectError,
-    NEITHER_HOST_ERR,
+    parse_remove_selectors, remove_from_hosts_and_registered_agents, RemovablePlugin, RemoveReport,
+    RemoveSelectError, NEITHER_HOST_ERR,
 };
 use aip_core::runner::SystemRunner;
 use aip_core::setup::{install_pi_packages, is_linked, run_setup};
@@ -733,6 +733,7 @@ fn cmd_remove(names: Vec<String>, verbose: bool) -> Result<()> {
     let runner = SystemRunner { verbose };
     let store_root = store::plugins_dir();
     let cwd = cwd()?;
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
     let plugins = list_removable_for_remove(&store_root, &cwd);
     let names = if names.is_empty() {
         if plugins.is_empty() {
@@ -751,7 +752,14 @@ fn cmd_remove(names: Vec<String>, verbose: bool) -> Result<()> {
 
     let mut any_hosts = false;
     for name in &names {
-        let report = remove_from_hosts(&runner, is_on_path, name, &store_root, &cwd);
+        let report = remove_from_hosts_and_registered_agents(
+            &runner,
+            is_on_path,
+            name,
+            &store_root,
+            &cwd,
+            &home,
+        );
         print_remove_report(&report);
         if !no_hosts_attempted(&report) {
             any_hosts = true;
